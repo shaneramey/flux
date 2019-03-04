@@ -99,8 +99,9 @@ func main() {
 		gitTimeout      = fs.Duration("git-timeout", 20*time.Second, "duration after which git operations time out")
 
 		// GPG commit signing
-		gitImportGPG  = fs.String("git-gpg-key-import", "", "keys at the path given (either a file or a directory) will be imported for use in signing commits")
-		gitSigningKey = fs.String("git-signing-key", "", "if set, commits will be signed with this GPG key")
+		gitImportGPG        = fs.String("git-gpg-key-import", "", "keys at the path given (either a file or a directory) will be imported for use in signing commits")
+		gitSigningKey       = fs.String("git-signing-key", "", "if set, commits will be signed with this GPG key")
+		gitVerifySignatures = fs.Bool("git-verify-signatures", false, "if set, commits will be verified before Flux applies them")
 
 		// syncing
 		syncInterval = fs.Duration("sync-interval", 5*time.Minute, "apply config in git to cluster at least this often, even if there are no new commits")
@@ -444,7 +445,7 @@ func main() {
 		SkipMessage: *gitSkipMessage,
 	}
 
-	repo := git.NewRepo(gitRemote, git.PollInterval(*gitPollInterval), git.Timeout(*gitTimeout))
+	repo := git.NewRepo(gitRemote, git.PollInterval(*gitPollInterval), git.Timeout(*gitTimeout), git.VerifySignatures(*gitVerifySignatures))
 	{
 		shutdownWg.Add(1)
 		go func() {

@@ -259,10 +259,17 @@ func moveTagAndPush(ctx context.Context, workingDir, tag, upstream string, tagAc
 }
 
 func verifyTag(ctx context.Context, workingDir, tag string) error {
-	var env []string
 	args := []string{"verify-tag", tag}
-	if err := execGitCmd(ctx, args, gitCmdConfig{dir: workingDir, env: env}); err != nil {
+	if err := execGitCmd(ctx, args, gitCmdConfig{dir: workingDir}); err != nil {
 		return errors.Wrap(err, "verifying tag "+tag)
+	}
+	return nil
+}
+
+func verifyCommit(ctx context.Context, workingDir, commit string) error {
+	args := []string{"verify-commit", commit}
+	if err := execGitCmd(ctx, args, gitCmdConfig{dir: workingDir}); err != nil {
+		return errors.Wrap(err, "verifying commit "+commit)
 	}
 	return nil
 }

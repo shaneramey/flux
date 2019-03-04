@@ -46,10 +46,11 @@ const (
 
 type Repo struct {
 	// As supplied to constructor
-	origin   Remote
-	interval time.Duration
-	timeout  time.Duration
-	readonly bool
+	origin           Remote
+	interval         time.Duration
+	timeout          time.Duration
+	readonly         bool
+	verifySignatures bool
 
 	// State
 	mu     sync.RWMutex
@@ -81,6 +82,12 @@ type Timeout time.Duration
 
 func (t Timeout) apply(r *Repo) {
 	r.timeout = time.Duration(t)
+}
+
+type VerifySignatures bool
+
+func (v VerifySignatures) apply(r *Repo) {
+	r.verifySignatures = bool(v)
 }
 
 var ReadOnly optionFunc = func(r *Repo) {
@@ -206,7 +213,18 @@ func (r *Repo) CommitsBefore(ctx context.Context, ref string, paths ...string) (
 	if err := r.errorIfNotReady(); err != nil {
 		return nil, err
 	}
-	return onelinelog(ctx, r.dir, ref, paths)
+	revs, err := onelinelog(ctx, r.dir, ref, paths)
+	if err != nil {
+		return nil, err
+	}
+	if r.verifySignatures {
+		for _, rev := range revs {
+			if err := verifyCommit(ctx, r.dir, rev.Revision); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return revs, nil
 }
 
 func (r *Repo) CommitsBetween(ctx context.Context, ref1, ref2 string, paths ...string) ([]Commit, error) {
@@ -215,7 +233,18 @@ func (r *Repo) CommitsBetween(ctx context.Context, ref1, ref2 string, paths ...s
 	if err := r.errorIfNotReady(); err != nil {
 		return nil, err
 	}
-	return onelinelog(ctx, r.dir, ref1+".."+ref2, paths)
+	revs, err := onelinelog(ctx, r.dir, ref1+".."+ref2, paths)
+	if err != nil {
+		return nil, err
+	}
+	if r.verifySignatures {
+		for _, rev := range revs {
+			if err := verifyCommit(ctx, r.dir, rev.Revision); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return revs, nil
 }
 
 // step attempts to advance the repo state machine, and returns `true`
