@@ -202,3 +202,7 @@ func (c *Checkout) ChangedFiles(ctx context.Context, ref string) ([]string, erro
 func (c *Checkout) NoteRevList(ctx context.Context) (map[string]struct{}, error) {
 	return noteRevList(ctx, c.dir, c.realNotesRef)
 }
+
+func (c *Checkout) CheckoutRev(ctx context.Context, rev string) error {
+	return checkout(ctx, c.dir, rev)
+}

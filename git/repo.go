@@ -237,14 +237,18 @@ func (r *Repo) CommitsBetween(ctx context.Context, ref1, ref2 string, paths ...s
 	if err != nil {
 		return nil, err
 	}
-	if r.verifySignatures {
-		for _, rev := range revs {
-			if err := verifyCommit(ctx, r.dir, rev.Revision); err != nil {
-				return nil, err
-			}
-		}
+	if !r.verifySignatures {
+		return revs, nil
 	}
-	return revs, nil
+	var validatedRevs []Commit
+	for _, rev := range revs {
+		err := verifyCommit(ctx, r.dir, rev.Revision)
+		if err != nil {
+			break
+		}
+		validatedRevs = append(validatedRevs, rev)
+	}
+	return validatedRevs, err
 }
 
 // step attempts to advance the repo state machine, and returns `true`

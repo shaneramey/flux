@@ -199,6 +199,52 @@ func (d *Daemon) doSync(logger log.Logger, lastKnownSyncTagRev *string, warnedAb
 		return err
 	}
 
+	// Retrieve commits we are going to work with. We do this early as a signature validation
+	// error may occur, resulting in a change to the newTagRev.
+	var initialSync bool
+	var commits []git.Commit
+	{
+		var err error
+		ctx, cancel := context.WithTimeout(ctx, d.GitOpTimeout)
+		if oldTagRev != "" {
+			commits, err = d.Repo.CommitsBetween(ctx, oldTagRev, newTagRev, d.GitConfig.Paths...)
+		} else {
+			initialSync = true
+			commits, err = d.Repo.CommitsBefore(ctx, newTagRev, d.GitConfig.Paths...)
+		}
+		cancel()
+		if err != nil {
+			switch len(commits) {
+			// We received no commits; this either means the whole operation failed
+			// or the first signature validation failed. In both cases we want to
+			// reapply state but without moving forward.
+			case 0:
+				newTagRev = oldTagRev
+				break
+			// We failed but received some commits; move forward till the latest
+			// successful commit.
+			default:
+				c := commits[len(commits)-1]
+				newTagRev = c.Revision
+			}
+			// Nothing to do...
+			if newTagRev == "" {
+				return err
+			}
+		}
+	}
+
+	// Did the newTagRev change? If this is the case we need a new working clone.
+	workingTagRev, err := working.HeadRevision(ctx)
+	if err != nil {
+		return err
+	}
+	if workingTagRev != newTagRev {
+		if err := working.CheckoutRev(ctx, newTagRev); err != nil {
+			return err
+		}
+	}
+
 	// Get a map of all resources defined in the repo
 	allResources, err := d.Manifests.LoadManifests(working.Dir(), working.ManifestDirs())
 	if err != nil {
@@ -223,23 +269,6 @@ func (d *Daemon) doSync(logger log.Logger, lastKnownSyncTagRev *string, warnedAb
 	}
 
 	// update notes and emit events for applied commits
-
-	var initialSync bool
-	var commits []git.Commit
-	{
-		var err error
-		ctx, cancel := context.WithTimeout(ctx, d.GitOpTimeout)
-		if oldTagRev != "" {
-			commits, err = d.Repo.CommitsBetween(ctx, oldTagRev, newTagRev, d.GitConfig.Paths...)
-		} else {
-			initialSync = true
-			commits, err = d.Repo.CommitsBefore(ctx, newTagRev, d.GitConfig.Paths...)
-		}
-		cancel()
-		if err != nil {
-			return err
-		}
-	}
 
 	// Figure out which service IDs changed in this release
 	changedResources := map[string]resource.Resource{}
