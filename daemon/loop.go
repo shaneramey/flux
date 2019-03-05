@@ -26,6 +26,7 @@ type LoopVars struct {
 	SyncInterval         time.Duration
 	RegistryPollInterval time.Duration
 	GitOpTimeout         time.Duration
+	GitVerifySignatures  bool
 
 	initOnce       sync.Once
 	syncSoon       chan struct{}
@@ -199,8 +200,8 @@ func (d *Daemon) doSync(logger log.Logger, lastKnownSyncTagRev *string, warnedAb
 		return err
 	}
 
-	// Retrieve commits we are going to work with. We do this early as a signature validation
-	// error may occur, resulting in a change to the newTagRev.
+	// Retrieve commits we are going to work with, we do this early as
+	// we may need to validate the signatures of the commits.
 	var initialSync bool
 	var commits []git.Commit
 	{
@@ -214,34 +215,38 @@ func (d *Daemon) doSync(logger log.Logger, lastKnownSyncTagRev *string, warnedAb
 		}
 		cancel()
 		if err != nil {
-			switch len(commits) {
-			// We received no commits; this either means the whole operation failed
-			// or the first signature validation failed. In both cases we want to
-			// reapply state but without moving forward.
-			case 0:
-				newTagRev = oldTagRev
-				break
-			// We failed but received some commits; move forward till the latest
-			// successful commit.
-			default:
-				c := commits[len(commits)-1]
-				newTagRev = c.Revision
-			}
-			// Nothing to do...
-			if newTagRev == "" {
-				return err
-			}
+			return err
 		}
 	}
 
-	// Did the newTagRev change? If this is the case we need a new working clone.
-	workingTagRev, err := working.HeadRevision(ctx)
-	if err != nil {
-		return err
-	}
-	if workingTagRev != newTagRev {
-		if err := working.CheckoutRev(ctx, newTagRev); err != nil {
-			return err
+	if d.GitVerifySignatures {
+		// Loop through the commits in ascending order and check if
+		// each commit is valid, if an invalid commit is found; mutate
+		// the commits we are going to work with up till the latest
+		// valid one.
+		for i := len(commits) - 1; i >= 0; i-- {
+			if !commits[i].Signature.Valid() {
+				logger.Log("warning", "invalid PGP signature for commit: %s", commits[i].Revision)
+				commits = commits[i+1:]
+				break
+			}
+		}
+
+		if len(commits) == 0 {
+			// We have no valid new commits to sync or cluster state to reapply; abort...
+			if initialSync {
+				return errors.New("Unable to sync as no commits with valid PGP signatures were found")
+			}
+			// We only want to reapply state but without moving forward.
+			newTagRev = oldTagRev
+			// If we hit an invalid commit we only want to sync the cluster till the latest valid
+			// commit we found, which is the first commit in the slice. Check if this is the case
+			// and maybe checkout the working clone on this commit rev.
+		} else if latestCommitRev := commits[len(commits)-1].Revision; newTagRev != latestCommitRev {
+			if err := working.Checkout(ctx, latestCommitRev); err != nil {
+				return err
+			}
+			newTagRev = latestCommitRev
 		}
 	}
 

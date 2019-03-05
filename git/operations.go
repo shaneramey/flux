@@ -207,7 +207,7 @@ func revlist(ctx context.Context, workingDir, ref string) ([]string, error) {
 // Return the revisions and one-line log commit messages
 func onelinelog(ctx context.Context, workingDir, refspec string, subdirs []string) ([]Commit, error) {
 	out := &bytes.Buffer{}
-	args := []string{"log", "--pretty=format:%GK|%H|%s", refspec}
+	args := []string{"log", "--pretty=format:%GK|%G?|%H|%s", refspec}
 	if len(subdirs) > 0 {
 		args = append(args, "--")
 		args = append(args, subdirs...)
@@ -224,10 +224,13 @@ func splitLog(s string) ([]Commit, error) {
 	lines := splitList(s)
 	commits := make([]Commit, len(lines))
 	for i, m := range lines {
-		parts := strings.SplitN(m, "|", 3)
-		commits[i].SigningKey = parts[0]
-		commits[i].Revision = parts[1]
-		commits[i].Message = parts[2]
+		parts := strings.SplitN(m, "|", 4)
+		commits[i].Signature = Signature{
+			Key:    parts[0],
+			Status: parts[1],
+		}
+		commits[i].Revision = parts[2]
+		commits[i].Message = parts[3]
 	}
 	return commits, nil
 }
@@ -262,14 +265,6 @@ func verifyTag(ctx context.Context, workingDir, tag string) error {
 	args := []string{"verify-tag", tag}
 	if err := execGitCmd(ctx, args, gitCmdConfig{dir: workingDir}); err != nil {
 		return errors.Wrap(err, "verifying tag "+tag)
-	}
-	return nil
-}
-
-func verifyCommit(ctx context.Context, workingDir, commit string) error {
-	args := []string{"verify-commit", commit}
-	if err := execGitCmd(ctx, args, gitCmdConfig{dir: workingDir}); err != nil {
-		return errors.Wrap(err, "verifying commit "+commit)
 	}
 	return nil
 }

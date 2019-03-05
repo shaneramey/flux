@@ -112,7 +112,7 @@ func TestSignedCommit(t *testing.T) {
 		t.Fatal("expected at least one commit")
 	}
 	expectedKey := signingKey[len(signingKey)-16:]
-	foundKey := commits[0].SigningKey[len(commits[0].SigningKey)-16:]
+	foundKey := commits[0].Signature.Key[len(commits[0].Signature.Key)-16:]
 	if expectedKey != foundKey {
 		t.Errorf(`expected commit signing key to be:
 %s
@@ -151,7 +151,7 @@ func TestSignedTag(t *testing.T) {
 }
 
 func TestCheckout(t *testing.T) {
-	repo, cleanup := Repo(t)
+	repo, cleanup := Repo(t, "")
 	defer cleanup()
 
 	sd, sg := make(chan struct{}), &sync.WaitGroup{}

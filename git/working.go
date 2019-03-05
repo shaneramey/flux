@@ -36,9 +36,9 @@ type Checkout struct {
 }
 
 type Commit struct {
-	SigningKey string
-	Revision   string
-	Message    string
+	Signature Signature
+	Revision  string
+	Message   string
 }
 
 // CommitAction - struct holding commit information
@@ -203,6 +203,6 @@ func (c *Checkout) NoteRevList(ctx context.Context) (map[string]struct{}, error)
 	return noteRevList(ctx, c.dir, c.realNotesRef)
 }
 
-func (c *Checkout) CheckoutRev(ctx context.Context, rev string) error {
+func (c *Checkout) Checkout(ctx context.Context, rev string) error {
 	return checkout(ctx, c.dir, rev)
 }

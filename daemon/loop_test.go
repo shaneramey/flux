@@ -20,6 +20,7 @@ import (
 	"github.com/weaveworks/flux/event"
 	"github.com/weaveworks/flux/git"
 	"github.com/weaveworks/flux/git/gittest"
+	"github.com/weaveworks/flux/gpg/gpgtest"
 	"github.com/weaveworks/flux/job"
 	registryMock "github.com/weaveworks/flux/registry/mock"
 )
@@ -33,12 +34,22 @@ const (
 )
 
 var (
-	k8s    *cluster.Mock
-	events *mockEventWriter
+	k8s                 *cluster.Mock
+	events              *mockEventWriter
+	gitConfig           = git.Config{
+		Branch:    "master",
+		SyncTag:   gitSyncTag,
+		NotesRef:  gitNotesRef,
+		UserName:  gitUser,
+		UserEmail: gitEmail,
+	}
+	loopVars           = LoopVars{
+		GitOpTimeout:        5 * time.Second,
+	}
 )
 
-func daemon(t *testing.T) (*Daemon, func()) {
-	repo, repoCleanup := gittest.Repo(t)
+func daemon(t *testing.T, config git.Config, vars LoopVars) (*Daemon, func()) {
+	repo, repoCleanup := gittest.Repo(t, config.SigningKey)
 
 	k8s = &cluster.Mock{}
 	k8s.ExportFunc = func() ([]byte, error) { return nil, nil }
@@ -52,26 +63,18 @@ func daemon(t *testing.T) (*Daemon, func()) {
 		t.Fatal(err)
 	}
 
-	gitConfig := git.Config{
-		Branch:    "master",
-		SyncTag:   gitSyncTag,
-		NotesRef:  gitNotesRef,
-		UserName:  gitUser,
-		UserEmail: gitEmail,
-	}
-
 	jobs := job.NewQueue(shutdown, wg)
 	d := &Daemon{
 		Cluster:        k8s,
 		Manifests:      &kubernetes.Manifests{Namespacer: alwaysDefault},
 		Registry:       &registryMock.Registry{},
 		Repo:           repo,
-		GitConfig:      gitConfig,
+		GitConfig:      config,
 		Jobs:           jobs,
 		JobStatusCache: &job.StatusCache{Size: 100},
 		EventWriter:    events,
 		Logger:         log.NewLogfmtLogger(os.Stdout),
-		LoopVars:       &LoopVars{GitOpTimeout: 5 * time.Second},
+		LoopVars: 		&vars,
 	}
 	return d, func() {
 		close(shutdown)
@@ -85,7 +88,7 @@ func daemon(t *testing.T) (*Daemon, func()) {
 func TestPullAndSync_InitialSync(t *testing.T) {
 	// No tag
 	// No notes
-	d, cleanup := daemon(t)
+	d, cleanup := daemon(t, gitConfig, loopVars)
 	defer cleanup()
 
 	syncCalled := 0
@@ -139,8 +142,148 @@ func TestPullAndSync_InitialSync(t *testing.T) {
 	}
 }
 
+func TestPullAndSync_InitialSync_InvalidSignature(t *testing.T) {
+	vars := loopVars
+	vars.GitVerifySignatures = true
+
+	d, cleanup := daemon(t, gitConfig, vars)
+	defer cleanup()
+
+	syncCalled := 0
+	k8s.SyncFunc = func(def cluster.SyncSet) error {
+		syncCalled++
+		return nil
+	}
+	var (
+		logger                   = log.NewLogfmtLogger(ioutil.Discard)
+		lastKnownSyncTagRev      string
+		warnedAboutSyncTagChange bool
+	)
+	err := d.doSync(logger, &lastKnownSyncTagRev, &warnedAboutSyncTagChange)
+	if err == nil {
+		t.Error("Expected error but got nil")
+	}
+
+	// It does not apply anything
+	if syncCalled != 0 {
+		t.Errorf("Sync was called %d times, should not be called at all", syncCalled)
+	}
+}
+
+func TestPullAndSync_InitialSync_ValidAndInvalidSignature(t *testing.T) {
+	gpgHome, gpgKey, gpgCleanup := gpgtest.GPGKey(t)
+	defer gpgCleanup()
+
+	os.Setenv("GNUPGHOME", gpgHome)
+	defer os.Unsetenv("GNUPGHOME")
+
+	config := gitConfig
+	config.SigningKey = gpgKey
+
+	vars := loopVars
+	vars.GitVerifySignatures = true
+
+	d, cleanup := daemon(t, config, vars)
+	defer cleanup()
+
+	ctx := context.Background()
+	var expectedRevision string
+	// Create a commit with a temp GPG key unknown to the daemon
+	err := d.WithClone(ctx, func(checkout *git.Checkout) error {
+		ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+
+		var err error
+		expectedRevision, err = checkout.HeadRevision(ctx)
+		if err != nil {
+			return err
+		}
+
+		// Push some new changes
+		dirs := checkout.ManifestDirs()
+		err = cluster.UpdateManifest(d.Manifests, checkout.Dir(), dirs, flux.MustParseResourceID("default:deployment/helloworld"), func(def []byte) ([]byte, error) {
+			// Empty the file
+			return []byte(""), nil
+		})
+		if err != nil {
+			return err
+		}
+
+		tmpGpgHome, tmpGpgKey, tmpGpgCleanup := gpgtest.GPGKey(t)
+		defer tmpGpgCleanup()
+		os.Setenv("GNUPGHOME", tmpGpgHome)
+		defer os.Setenv("GNUPGHOME", gpgHome)
+
+		commitAction := git.CommitAction{Author: "", Message: "test commit", SigningKey: tmpGpgKey}
+		err = checkout.CommitAndPush(ctx, commitAction, nil)
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = d.Repo.Refresh(ctx)
+	if err != nil {
+		t.Error(err)
+	}
+
+	syncCalled := 0
+	var syncDef *cluster.SyncSet
+	expectedResourceIDs := flux.ResourceIDs{}
+	for id, _ := range testfiles.ResourceMap {
+		expectedResourceIDs = append(expectedResourceIDs, id)
+	}
+	expectedResourceIDs.Sort()
+	k8s.SyncFunc = func(def cluster.SyncSet) error {
+		syncCalled++
+		syncDef = &def
+		return nil
+	}
+	var (
+		logger                   = log.NewLogfmtLogger(ioutil.Discard)
+		lastKnownSyncTagRev      string
+		warnedAboutSyncTagChange bool
+	)
+	err = d.doSync(logger, &lastKnownSyncTagRev, &warnedAboutSyncTagChange)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// It applies
+	if syncCalled != 1 {
+		t.Errorf("Sync was not called once, was called %d times", syncCalled)
+	} else if syncDef == nil {
+		t.Errorf("Sync was called with a nil syncDef")
+	}
+
+	// The emitted event has all service ids (we removed one in a commit with unknown signature)
+	es, err := events.AllEvents(time.Time{}, -1, time.Time{})
+	if err != nil {
+		t.Error(err)
+	} else if len(es) != 1 {
+		t.Errorf("Unexpected events: %#v", es)
+	} else if es[0].Type != event.EventSync {
+		t.Errorf("Unexpected event type: %#v", es[0])
+	} else {
+		gotResourceIDs := es[0].ServiceIDs
+		flux.ResourceIDs(gotResourceIDs).Sort()
+		if !reflect.DeepEqual(gotResourceIDs, []flux.ResourceID(expectedResourceIDs)) {
+			t.Errorf("Unexpected event service ids: %#v, expected: %#v", gotResourceIDs, expectedResourceIDs)
+		}
+	}
+
+	// It creates the correct tag
+	if err := d.Repo.Refresh(context.Background()); err != nil {
+		t.Errorf("pulling sync tag: %v", err)
+	} else if actualRevision, err := d.Repo.Revision(ctx, gitSyncTag); err != nil {
+		t.Errorf("finding revisions for sync tag: %v", err)
+	} else if actualRevision != expectedRevision {
+		t.Errorf("expected revision %s got %s", expectedRevision, actualRevision)
+	}
+}
+
 func TestDoSync_NoNewCommits(t *testing.T) {
-	d, cleanup := daemon(t)
+	d, cleanup := daemon(t, gitConfig, loopVars)
 	defer cleanup()
 
 	ctx := context.Background()
@@ -213,7 +356,7 @@ func TestDoSync_NoNewCommits(t *testing.T) {
 }
 
 func TestDoSync_WithNewCommit(t *testing.T) {
-	d, cleanup := daemon(t)
+	d, cleanup := daemon(t, gitConfig, loopVars)
 	defer cleanup()
 
 	ctx := context.Background()

@@ -445,7 +445,7 @@ func main() {
 		SkipMessage: *gitSkipMessage,
 	}
 
-	repo := git.NewRepo(gitRemote, git.PollInterval(*gitPollInterval), git.Timeout(*gitTimeout), git.VerifySignatures(*gitVerifySignatures))
+	repo := git.NewRepo(gitRemote, git.PollInterval(*gitPollInterval), git.Timeout(*gitTimeout))
 	{
 		shutdownWg.Add(1)
 		go func() {
@@ -486,6 +486,7 @@ func main() {
 			SyncInterval:         *syncInterval,
 			RegistryPollInterval: *registryPollInterval,
 			GitOpTimeout:         *gitTimeout,
+			GitVerifySignatures:  *gitVerifySignatures,
 		},
 	}
 
