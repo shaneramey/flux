@@ -31,12 +31,14 @@ type LoopVars struct {
 	initOnce       sync.Once
 	syncSoon       chan struct{}
 	pollImagesSoon chan struct{}
+	blockImagePoll bool
 }
 
 func (loop *LoopVars) ensureInit() {
 	loop.initOnce.Do(func() {
 		loop.syncSoon = make(chan struct{}, 1)
 		loop.pollImagesSoon = make(chan struct{}, 1)
+		loop.blockImagePoll = true
 	})
 }
 
@@ -221,23 +223,32 @@ func (d *Daemon) doSync(logger log.Logger, lastKnownSyncTagRev *string, warnedAb
 
 	if d.GitVerifySignatures {
 		// Loop through the commits in ascending order and check if
-		// each commit is valid, if an invalid commit is found; mutate
-		// the commits we are going to work with up till the latest
-		// valid one.
+		// each commit has a valid signature; if an invalid commit is
+		// found, we mutate the set of commits we are going to work
+		// with to the ones we have validated.
 		for i := len(commits) - 1; i >= 0; i-- {
 			if !commits[i].Signature.Valid() {
-				logger.Log("warning", "invalid PGP signature for commit: %s", commits[i].Revision)
+				// Block image updates, this has two reasons;
+				// 1. we would apply updates on top of something we
+				//    do not see as valid, _indirectly_ giving it
+				//    more authenticity
+				// 2. the pushed updates would never reach the
+				//    cluster as we will never get past the invalid
+				//    commit we just encountered
+				d.LoopVars.blockImagePoll = true
+				logger.Log("warning", "invalid PGP signature for commit", "revision", commits[i].Revision)
 				commits = commits[i+1:]
 				break
 			}
 		}
 
+		// We have no valid commits, determine what we should do next...
 		if len(commits) == 0 {
-			// We have no valid new commits to sync or cluster state to reapply; abort...
+			// We have no state to reapply either; abort...
 			if initialSync {
-				return errors.New("Unable to sync as no commits with valid PGP signatures were found")
+				return errors.New("unable to sync as no commits with valid PGP signatures were found")
 			}
-			// We only want to reapply state but without moving forward.
+			// Reapply the old rev as this is the latest valid state we saw
 			newTagRev = oldTagRev
 			// If we hit an invalid commit we only want to sync the cluster till the latest valid
 			// commit we found, which is the first commit in the slice. Check if this is the case
@@ -247,6 +258,8 @@ func (d *Daemon) doSync(logger log.Logger, lastKnownSyncTagRev *string, warnedAb
 				return err
 			}
 			newTagRev = latestCommitRev
+		} else {
+			d.LoopVars.blockImagePoll = false
 		}
 	}
 
