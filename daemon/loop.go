@@ -228,7 +228,7 @@ func (d *Daemon) doSync(logger log.Logger, lastKnownSyncTagRev *string, warnedAb
 		err := working.VerifySyncTag(ctx)
 		if !initialSync && err != nil {
 			// Block images updates, for detailed explanation see below.
-			d.LoopVars.blockImagePoll = true
+			d.blockImagePoll = true
 			return errors.Wrap(err, "failed to verify signature of sync tag")
 		}
 
@@ -245,8 +245,8 @@ func (d *Daemon) doSync(logger log.Logger, lastKnownSyncTagRev *string, warnedAb
 				// 2. the pushed updates would never reach the
 				//    cluster as we will never get past the invalid
 				//    commit we just encountered
-				d.LoopVars.blockImagePoll = true
-				logger.Log("warning", "invalid PGP signature for commit", "revision", commits[i].Revision)
+				d.blockImagePoll = true
+				logger.Log("warning", "invalid GPG signature for commit", "revision", commits[i].Revision, "key", commits[i].Signature.Key)
 				commits = commits[i+1:]
 				break
 			}
@@ -256,7 +256,7 @@ func (d *Daemon) doSync(logger log.Logger, lastKnownSyncTagRev *string, warnedAb
 		if len(commits) == 0 {
 			// We have no state to reapply either; abort...
 			if initialSync {
-				return errors.New("unable to sync as no commits with valid PGP signatures were found")
+				return errors.New("unable to sync as no commits with valid GPG signatures were found")
 			}
 			// Reapply the old rev as this is the latest valid state we saw
 			newTagRev = oldTagRev
@@ -269,7 +269,7 @@ func (d *Daemon) doSync(logger log.Logger, lastKnownSyncTagRev *string, warnedAb
 			}
 			newTagRev = latestCommitRev
 		} else {
-			d.LoopVars.blockImagePoll = false
+			d.blockImagePoll = false
 		}
 	}
 

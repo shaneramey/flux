@@ -14,7 +14,7 @@ import (
 )
 
 func (d *Daemon) pollForNewImages(logger log.Logger) {
-	if d.LoopVars.GitVerifySignatures && d.LoopVars.blockImagePoll {
+	if d.GitVerifySignatures && d.blockImagePoll {
 		logger.Log("error", "image polling is blocked")
 		return
 	}
