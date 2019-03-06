@@ -222,6 +222,16 @@ func (d *Daemon) doSync(logger log.Logger, lastKnownSyncTagRev *string, warnedAb
 	}
 
 	if d.GitVerifySignatures {
+		// Verify the sync tag we used to get our commits, if it is not
+		// signed by a trusted source we can not trust the changeset we
+		// are working with and need to kill the op.
+		err := working.VerifySyncTag(ctx)
+		if !initialSync && err != nil {
+			// Block images updates, for detailed explanation see below.
+			d.LoopVars.blockImagePoll = true
+			return errors.Wrap(err, "failed to verify signature of sync tag")
+		}
+
 		// Loop through the commits in ascending order and check if
 		// each commit has a valid signature; if an invalid commit is
 		// found, we mutate the set of commits we are going to work
