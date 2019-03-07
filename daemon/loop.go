@@ -2,24 +2,12 @@ package daemon
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/base64"
 	"fmt"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/go-kit/kit/log"
-	"github.com/pkg/errors"
-
-	"github.com/weaveworks/flux"
-	"github.com/weaveworks/flux/cluster"
-	"github.com/weaveworks/flux/event"
-	"github.com/weaveworks/flux/git"
 	fluxmetrics "github.com/weaveworks/flux/metrics"
-	"github.com/weaveworks/flux/resource"
-	fluxsync "github.com/weaveworks/flux/sync"
-	"github.com/weaveworks/flux/update"
 )
 
 type LoopVars struct {
@@ -31,6 +19,8 @@ type LoopVars struct {
 	initOnce       sync.Once
 	syncSoon       chan struct{}
 	pollImagesSoon chan struct{}
+	lastKnownSyncTagRev string
+	warnedAboutSyncTagChange bool
 	blockImagePoll bool
 }
 
@@ -63,10 +53,6 @@ func (d *Daemon) Loop(stop chan struct{}, wg *sync.WaitGroup, logger log.Logger)
 	d.AskForImagePoll()
 
 	for {
-		var (
-			lastKnownSyncTagRev      string
-			warnedAboutSyncTagChange bool
-		)
 		select {
 		case <-stop:
 			logger.Log("stopping", "true")
@@ -89,7 +75,9 @@ func (d *Daemon) Loop(stop chan struct{}, wg *sync.WaitGroup, logger log.Logger)
 				default:
 				}
 			}
-			if err := d.doSync(logger, &lastKnownSyncTagRev, &warnedAboutSyncTagChange); err != nil {
+			sync := d.NewSync(logger)
+			ctx := context.Background()
+			if err := sync.Run(ctx); err != nil {
 				logger.Log("err", err)
 			}
 			syncTimer.Reset(d.SyncInterval)
@@ -151,376 +139,4 @@ func (d *LoopVars) AskForImagePoll() {
 	case d.pollImagesSoon <- struct{}{}:
 	default:
 	}
-}
-
-// -- extra bits the loop needs
-
-func (d *Daemon) doSync(logger log.Logger, lastKnownSyncTagRev *string, warnedAboutSyncTagChange *bool) (retErr error) {
-	started := time.Now().UTC()
-	defer func() {
-		syncDuration.With(
-			fluxmetrics.LabelSuccess, fmt.Sprint(retErr == nil),
-		).Observe(time.Since(started).Seconds())
-	}()
-
-	syncSetName := makeSyncLabel(d.Repo.Origin(), d.GitConfig)
-
-	// We don't care how long this takes overall, only about not
-	// getting bogged down in certain operations, so use an
-	// undeadlined context in general.
-	ctx := context.Background()
-
-	// checkout a working clone so we can mess around with tags later
-	var working *git.Checkout
-	{
-		var err error
-		ctx, cancel := context.WithTimeout(ctx, d.GitOpTimeout)
-		defer cancel()
-		working, err = d.Repo.Clone(ctx, d.GitConfig)
-		if err != nil {
-			return err
-		}
-		defer working.Clean()
-	}
-
-	// For comparison later.
-	oldTagRev, err := working.SyncRevision(ctx)
-	if err != nil && !isUnknownRevision(err) {
-		return err
-	}
-	// Check if something other than the current instance of fluxd changed the sync tag.
-	// This is likely to be caused by another fluxd instance using the same tag.
-	// Having multiple instances fighting for the same tag can lead to fluxd missing manifest changes.
-	if *lastKnownSyncTagRev != "" && oldTagRev != *lastKnownSyncTagRev && !*warnedAboutSyncTagChange {
-		logger.Log("warning",
-			"detected external change in git sync tag; the sync tag should not be shared by fluxd instances")
-		*warnedAboutSyncTagChange = true
-	}
-
-	newTagRev, err := working.HeadRevision(ctx)
-	if err != nil {
-		return err
-	}
-
-	// Retrieve commits we are going to work with, we do this early as
-	// we may need to validate the signatures of the commits.
-	var initialSync bool
-	var commits []git.Commit
-	{
-		var err error
-		ctx, cancel := context.WithTimeout(ctx, d.GitOpTimeout)
-		if oldTagRev != "" {
-			commits, err = d.Repo.CommitsBetween(ctx, oldTagRev, newTagRev, d.GitConfig.Paths...)
-		} else {
-			initialSync = true
-			commits, err = d.Repo.CommitsBefore(ctx, newTagRev, d.GitConfig.Paths...)
-		}
-		cancel()
-		if err != nil {
-			return err
-		}
-	}
-
-	if d.GitVerifySignatures {
-		// Verify the sync tag we used to get our commits, if it is not
-		// signed by a trusted source we can not trust the changeset we
-		// are working with and need to kill the op.
-		err := working.VerifySyncTag(ctx)
-		if !initialSync && err != nil {
-			// Block images updates, for detailed explanation see below.
-			d.blockImagePoll = true
-			return errors.Wrap(err, "failed to verify signature of sync tag")
-		}
-
-		// Loop through the commits in ascending order and check if
-		// each commit has a valid signature; if an invalid commit is
-		// found, we mutate the set of commits we are going to work
-		// with to the ones we have validated.
-		for i := len(commits) - 1; i >= 0; i-- {
-			if !commits[i].Signature.Valid() {
-				// Block image updates, this has two reasons;
-				// 1. we would apply updates on top of something we
-				//    do not see as valid, _indirectly_ giving it
-				//    more authenticity
-				// 2. the pushed updates would never reach the
-				//    cluster as we will never get past the invalid
-				//    commit we just encountered
-				d.blockImagePoll = true
-				logger.Log("warning", "invalid GPG signature for commit", "revision", commits[i].Revision, "key", commits[i].Signature.Key)
-				commits = commits[i+1:]
-				break
-			}
-		}
-
-		// We have no valid commits, determine what we should do next...
-		if len(commits) == 0 {
-			// We have no state to reapply either; abort...
-			if initialSync {
-				return errors.New("unable to sync as no commits with valid GPG signatures were found")
-			}
-			// Reapply the old rev as this is the latest valid state we saw
-			newTagRev = oldTagRev
-			// If we hit an invalid commit we only want to sync the cluster till the latest valid
-			// commit we found, which is the first commit in the slice. Check if this is the case
-			// and maybe checkout the working clone on this commit rev.
-		} else if latestCommitRev := commits[len(commits)-1].Revision; newTagRev != latestCommitRev {
-			if err := working.Checkout(ctx, latestCommitRev); err != nil {
-				return err
-			}
-			newTagRev = latestCommitRev
-		} else {
-			d.blockImagePoll = false
-		}
-	}
-
-	// Get a map of all resources defined in the repo
-	allResources, err := d.Manifests.LoadManifests(working.Dir(), working.ManifestDirs())
-	if err != nil {
-		return errors.Wrap(err, "loading resources from repo")
-	}
-
-	var resourceErrors []event.ResourceError
-	if err := fluxsync.Sync(syncSetName, allResources, d.Cluster); err != nil {
-		logger.Log("err", err)
-		switch syncerr := err.(type) {
-		case cluster.SyncError:
-			for _, e := range syncerr {
-				resourceErrors = append(resourceErrors, event.ResourceError{
-					ID:    e.ResourceID,
-					Path:  e.Source,
-					Error: e.Error.Error(),
-				})
-			}
-		default:
-			return err
-		}
-	}
-
-	// update notes and emit events for applied commits
-
-	// Figure out which service IDs changed in this release
-	changedResources := map[string]resource.Resource{}
-
-	if initialSync {
-		// no synctag, We are syncing everything from scratch
-		changedResources = allResources
-	} else {
-		ctx, cancel := context.WithTimeout(ctx, d.GitOpTimeout)
-		changedFiles, err := working.ChangedFiles(ctx, oldTagRev)
-		if err == nil && len(changedFiles) > 0 {
-			// We had some changed files, we're syncing a diff
-			// FIXME(michael): this won't be accurate when a file can have more than one resource
-			changedResources, err = d.Manifests.LoadManifests(working.Dir(), changedFiles)
-		}
-		cancel()
-		if err != nil {
-			return errors.Wrap(err, "loading resources from repo")
-		}
-	}
-
-	serviceIDs := flux.ResourceIDSet{}
-	for _, r := range changedResources {
-		serviceIDs.Add([]flux.ResourceID{r.ResourceID()})
-	}
-
-	var notes map[string]struct{}
-	{
-		ctx, cancel := context.WithTimeout(ctx, d.GitOpTimeout)
-		notes, err = working.NoteRevList(ctx)
-		cancel()
-		if err != nil {
-			return errors.Wrap(err, "loading notes from repo")
-		}
-	}
-
-	// Collect any events that come from notes attached to the commits
-	// we just synced. While we're doing this, keep track of what
-	// other things this sync includes e.g., releases and
-	// autoreleases, that we're already posting as events, so upstream
-	// can skip the sync event if it wants to.
-	includes := make(map[string]bool)
-	if len(commits) > 0 {
-		var noteEvents []event.Event
-
-		// Find notes in revisions.
-		for i := len(commits) - 1; i >= 0; i-- {
-			if _, ok := notes[commits[i].Revision]; !ok {
-				includes[event.NoneOfTheAbove] = true
-				continue
-			}
-			ctx, cancel := context.WithTimeout(ctx, d.GitOpTimeout)
-			var n note
-			ok, err := working.GetNote(ctx, commits[i].Revision, &n)
-			cancel()
-			if err != nil {
-				return errors.Wrap(err, "loading notes from repo")
-			}
-			if !ok {
-				includes[event.NoneOfTheAbove] = true
-				continue
-			}
-
-			// If this is the first sync, we should expect no notes,
-			// since this is supposedly the first time we're seeing
-			// the repo. But there are circumstances in which we can
-			// nonetheless see notes -- if the tag was deleted from
-			// the upstream repo, or if this accidentally has the same
-			// notes ref as another daemon using the same repo (but a
-			// different tag). Either way, we don't want to report any
-			// notes on an initial sync, since they (most likely)
-			// don't belong to us.
-			if initialSync {
-				logger.Log("warning", "no notes expected on initial sync; this repo may be in use by another fluxd")
-				break
-			}
-
-			// Interpret some notes as events to send to the upstream
-			switch n.Spec.Type {
-			case update.Containers:
-				spec := n.Spec.Spec.(update.ReleaseContainersSpec)
-				noteEvents = append(noteEvents, event.Event{
-					ServiceIDs: n.Result.AffectedResources(),
-					Type:       event.EventRelease,
-					StartedAt:  started,
-					EndedAt:    time.Now().UTC(),
-					LogLevel:   event.LogLevelInfo,
-					Metadata: &event.ReleaseEventMetadata{
-						ReleaseEventCommon: event.ReleaseEventCommon{
-							Revision: commits[i].Revision,
-							Result:   n.Result,
-							Error:    n.Result.Error(),
-						},
-						Spec: event.ReleaseSpec{
-							Type:                  event.ReleaseContainersSpecType,
-							ReleaseContainersSpec: &spec,
-						},
-						Cause: n.Spec.Cause,
-					},
-				})
-				includes[event.EventRelease] = true
-			case update.Images:
-				spec := n.Spec.Spec.(update.ReleaseImageSpec)
-				noteEvents = append(noteEvents, event.Event{
-					ServiceIDs: n.Result.AffectedResources(),
-					Type:       event.EventRelease,
-					StartedAt:  started,
-					EndedAt:    time.Now().UTC(),
-					LogLevel:   event.LogLevelInfo,
-					Metadata: &event.ReleaseEventMetadata{
-						ReleaseEventCommon: event.ReleaseEventCommon{
-							Revision: commits[i].Revision,
-							Result:   n.Result,
-							Error:    n.Result.Error(),
-						},
-						Spec: event.ReleaseSpec{
-							Type:             event.ReleaseImageSpecType,
-							ReleaseImageSpec: &spec,
-						},
-						Cause: n.Spec.Cause,
-					},
-				})
-				includes[event.EventRelease] = true
-			case update.Auto:
-				spec := n.Spec.Spec.(update.Automated)
-				noteEvents = append(noteEvents, event.Event{
-					ServiceIDs: n.Result.AffectedResources(),
-					Type:       event.EventAutoRelease,
-					StartedAt:  started,
-					EndedAt:    time.Now().UTC(),
-					LogLevel:   event.LogLevelInfo,
-					Metadata: &event.AutoReleaseEventMetadata{
-						ReleaseEventCommon: event.ReleaseEventCommon{
-							Revision: commits[i].Revision,
-							Result:   n.Result,
-							Error:    n.Result.Error(),
-						},
-						Spec: spec,
-					},
-				})
-				includes[event.EventAutoRelease] = true
-			case update.Policy:
-				// Use this to mean any change to policy
-				includes[event.EventUpdatePolicy] = true
-			default:
-				// Presume it's not something we're otherwise sending
-				// as an event
-				includes[event.NoneOfTheAbove] = true
-			}
-		}
-
-		cs := make([]event.Commit, len(commits))
-		for i, c := range commits {
-			cs[i].Revision = c.Revision
-			cs[i].Message = c.Message
-		}
-		if err = d.LogEvent(event.Event{
-			ServiceIDs: serviceIDs.ToSlice(),
-			Type:       event.EventSync,
-			StartedAt:  started,
-			EndedAt:    started,
-			LogLevel:   event.LogLevelInfo,
-			Metadata: &event.SyncEventMetadata{
-				Commits:     cs,
-				InitialSync: initialSync,
-				Includes:    includes,
-				Errors:      resourceErrors,
-			},
-		}); err != nil {
-			logger.Log("err", err)
-			// Abort early to ensure at least once delivery of events
-			return err
-		}
-
-		for _, event := range noteEvents {
-			if err = d.LogEvent(event); err != nil {
-				logger.Log("err", err)
-				// Abort early to ensure at least once delivery of events
-				return err
-			}
-		}
-	}
-
-	// Move the tag and push it so we know how far we've gotten.
-	if oldTagRev != newTagRev {
-		{
-			ctx, cancel := context.WithTimeout(ctx, d.GitOpTimeout)
-			tagAction := git.TagAction{
-				Revision: newTagRev,
-				Message:  "Sync pointer",
-			}
-			err := working.MoveSyncTagAndPush(ctx, tagAction)
-			cancel()
-			if err != nil {
-				return err
-			}
-			*lastKnownSyncTagRev = newTagRev
-		}
-		logger.Log("tag", d.GitConfig.SyncTag, "old", oldTagRev, "new", newTagRev)
-		{
-			ctx, cancel := context.WithTimeout(ctx, d.GitOpTimeout)
-			err := d.Repo.Refresh(ctx)
-			cancel()
-			return err
-		}
-	}
-	return nil
-}
-
-func isUnknownRevision(err error) bool {
-	return err != nil &&
-		(strings.Contains(err.Error(), "unknown revision or path not in the working tree.") ||
-			strings.Contains(err.Error(), "bad revision"))
-}
-
-func makeSyncLabel(remote git.Remote, conf git.Config) string {
-	urlbit := remote.SafeURL()
-	pathshash := sha256.New()
-	pathshash.Write([]byte(urlbit))
-	pathshash.Write([]byte(conf.Branch))
-	for _, path := range conf.Paths {
-		pathshash.Write([]byte(path))
-	}
-	// the prefix is in part to make sure it's a valid (Kubernetes)
-	// label value -- a modest abstraction leak
-	return "git-" + base64.RawURLEncoding.EncodeToString(pathshash.Sum(nil))
 }
