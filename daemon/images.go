@@ -13,8 +13,13 @@ import (
 	"github.com/weaveworks/flux/update"
 )
 
-func (d *Daemon) pollForNewImages(logger log.Logger) {
-	if d.GitVerifySignatures && d.blockImagePoll {
+type ImagePollLock interface {
+	Locked() bool
+	Lock(b bool)
+}
+
+func (d *Daemon) pollForNewImages(logger log.Logger, imagePollLock ImagePollLock) {
+	if imagePollLock.Locked() {
 		logger.Log("error", "image polling is blocked")
 		return
 	}

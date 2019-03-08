@@ -13,22 +13,16 @@ import (
 type LoopVars struct {
 	SyncInterval         time.Duration
 	RegistryPollInterval time.Duration
-	GitOpTimeout         time.Duration
-	GitVerifySignatures  bool
 
 	initOnce       sync.Once
 	syncSoon       chan struct{}
 	pollImagesSoon chan struct{}
-	lastKnownSyncTagRev string
-	warnedAboutSyncTagChange bool
-	blockImagePoll bool
 }
 
 func (loop *LoopVars) ensureInit() {
 	loop.initOnce.Do(func() {
 		loop.syncSoon = make(chan struct{}, 1)
 		loop.pollImagesSoon = make(chan struct{}, 1)
-		loop.blockImagePoll = true
 	})
 }
 
@@ -53,6 +47,13 @@ func (d *Daemon) Loop(stop chan struct{}, wg *sync.WaitGroup, logger log.Logger)
 	d.AskForImagePoll()
 
 	for {
+		var (
+			lastKnownSyncTag = &lastKnownSyncTag{}
+			// If the verification of git signatures is enabled we
+			// want to disable the updates of images until we have
+			// verified the state of the git repository can be trusted.
+			imagePollLock = &imagePollLock{d.GitConfig.VerifySignatures}
+		)
 		select {
 		case <-stop:
 			logger.Log("stopping", "true")
@@ -64,7 +65,7 @@ func (d *Daemon) Loop(stop chan struct{}, wg *sync.WaitGroup, logger log.Logger)
 				default:
 				}
 			}
-			d.pollForNewImages(logger)
+			d.pollForNewImages(logger, imagePollLock)
 			imagePollTimer.Reset(d.RegistryPollInterval)
 		case <-imagePollTimer.C:
 			d.AskForImagePoll()
@@ -75,16 +76,19 @@ func (d *Daemon) Loop(stop chan struct{}, wg *sync.WaitGroup, logger log.Logger)
 				default:
 				}
 			}
-			sync := d.NewSync(logger)
-			ctx := context.Background()
-			if err := sync.Run(ctx); err != nil {
+			sync, err := d.NewSync(logger)
+			if err != nil {
+				logger.Log("err", err)
+				continue
+			}
+			if err := sync.Run(context.Background(), lastKnownSyncTag, imagePollLock); err != nil {
 				logger.Log("err", err)
 			}
 			syncTimer.Reset(d.SyncInterval)
 		case <-syncTimer.C:
 			d.AskForSync()
 		case <-d.Repo.C:
-			ctx, cancel := context.WithTimeout(context.Background(), d.GitOpTimeout)
+			ctx, cancel := context.WithTimeout(context.Background(), d.GitConfig.Timeout)
 			newSyncHead, err := d.Repo.Revision(ctx, d.GitConfig.Branch)
 			cancel()
 			if err != nil {
@@ -112,7 +116,7 @@ func (d *Daemon) Loop(stop chan struct{}, wg *sync.WaitGroup, logger log.Logger)
 				jobLogger.Log("state", "done", "success", "false", "err", err)
 			} else {
 				jobLogger.Log("state", "done", "success", "true")
-				ctx, cancel := context.WithTimeout(context.Background(), d.GitOpTimeout)
+				ctx, cancel := context.WithTimeout(context.Background(), d.GitConfig.Timeout)
 				err := d.Repo.Refresh(ctx)
 				if err != nil {
 					logger.Log("err", err)
@@ -139,4 +143,39 @@ func (d *LoopVars) AskForImagePoll() {
 	case d.pollImagesSoon <- struct{}{}:
 	default:
 	}
+}
+
+// -- internals to keep track of sync tag state
+type lastKnownSyncTag struct {
+	revision          string
+	warnedAboutChange bool
+}
+
+func (s *lastKnownSyncTag) Revision() string {
+	return s.revision
+}
+
+func (s *lastKnownSyncTag) SetRevision(rev string) {
+	s.revision = rev
+}
+
+func (s *lastKnownSyncTag) WarnedAboutChange() bool {
+	return s.warnedAboutChange
+}
+
+func (s *lastKnownSyncTag) SetWarnedAboutChange(warned bool) {
+	s.warnedAboutChange = warned
+}
+
+// -- internals to lock the polling of images
+type imagePollLock struct {
+	locked bool
+}
+
+func (l *imagePollLock) Locked() bool {
+	return l.locked
+}
+
+func (l *imagePollLock) Lock(b bool) {
+	l.locked = b
 }

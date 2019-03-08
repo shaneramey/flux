@@ -22,75 +22,116 @@ import (
 
 // Sync holds the data we are working with during a sync.
 type Sync struct {
+	started		time.Time
 	logger      log.Logger
 	working     *git.Checkout
+	repo        *git.Repo
+	gitConfig   git.Config
+	manifests   cluster.Manifests
+	cluster		cluster.Cluster
+	eventLogger
+}
+
+type SyncTag interface {
+	Revision() string
+	SetRevision(rev string)
+	WarnedAboutChange() bool
+	SetWarnedAboutChange(warned bool)
+}
+
+type eventLogger interface {
+	LogEvent(e event.Event) error
+}
+
+type changeset struct {
+	commits     []git.Commit
 	oldTagRev   string
 	newTagRev   string
 	initialSync bool
-	commits     []git.Commit
-
-	*Daemon
 }
 
-// NewSync prepares a sync.
-func (d *Daemon) NewSync(logger log.Logger) Sync {
-	s := Sync{logger: logger, Daemon: d}
+// NewSync initializes a new sync.
+func (d *Daemon) NewSync(logger log.Logger) (Sync, error) {
+	s := Sync{
+		logger: logger,
+		repo: d.Repo,
+		gitConfig: d.GitConfig,
+		manifests: d.Manifests,
+		cluster: d.Cluster,
+		eventLogger: d,
+	}
 
-	return s
+	// checkout out a working clone used for this sync.
+	var err error
+	ctx, cancel := context.WithTimeout(context.Background(), s.gitConfig.Timeout)
+	s.working, err = s.repo.Clone(ctx, s.gitConfig); 
+	cancel()
+
+	return s, err
 }
 
-// Run starts the sync.
-func (s *Sync) Run(ctx context.Context) (retErr error) {
-	started := time.Now().UTC()
+// Run starts the synchronization of the cluster with git.
+func (s *Sync) Run(ctx context.Context, synctag SyncTag, imagePollLock ImagePollLock) (retErr error) {
+	s.started = time.Now().UTC()
+	defer s.working.Clean()
 	defer func() {
 		syncDuration.With(
 			fluxmetrics.LabelSuccess, fmt.Sprint(retErr == nil),
-		).Observe(time.Since(started).Seconds())
+		).Observe(time.Since(s.started).Seconds())
 	}()
 
-	if err := s.checkout(ctx); err != nil {
-		return err
-	}
-	defer s.working.Clean()
-
-	if err := s.loadTagRevisions(ctx); err != nil {
-		return err
-	}
-
-	if s.GitVerifySignatures {
-		if err := s.verifySyncTagSignature(ctx); err != nil {
-			return err
-		}
-		if err := s.verifyCommitSignatures(); err != nil {
-			s.logger.Log("err", err)
-		}
-		if err := s.verifyWorkingState(ctx); err != nil {
-			return err
-		}
-	}
-
-	syncSetName := makeSyncLabel(s.Repo.Origin(), s.GitConfig)
-	resources, resourceErrors, err := s.doSync(syncSetName)
+	c, err := getChangeset(ctx, s)
 	if err != nil {
 		return err
 	}
 
-	changedResources, err := s.getChangedResources(ctx, resources)
+	// Check if something other than the current instance of fluxd changed the sync tag.
+	// This is likely to be caused by another fluxd instance using the same tag.
+	// Having multiple instances fighting for the same tag can lead to fluxd missing manifest changes.
+	if synctag.Revision() != "" && c.oldTagRev != synctag.Revision() && !synctag.WarnedAboutChange() {
+		s.logger.Log("warning",
+			"detected external change in git sync tag; the sync tag should not be shared by fluxd instances")
+		synctag.SetWarnedAboutChange(true)
+	}
+
+	if s.gitConfig.VerifySignatures {
+		if err := verifySyncTagSignature(ctx, s.working, c); err != nil {
+			imagePollLock.Lock(true)
+			return err
+		}
+		if err = verifyCommitSignatures(&c); err != nil {
+			imagePollLock.Lock(true)
+			s.logger.Log("err", err)
+		}
+		ok, err := verifyWorkingState(ctx, s.working, &c)
+		imagePollLock.Lock(!ok)
+		if err != nil {
+			return err
+		}
+	}
+
+	syncSetName := makeSyncLabel(s.repo.Origin(), s.gitConfig)
+	resources, resourceErrors, err := doSync(s, syncSetName)
+	if err != nil {
+		return err
+	}
+
+	changedResources, err := getChangedResources(ctx, s, c, resources)
 	serviceIDs := flux.ResourceIDSet{}
 	for _, r := range changedResources {
 		serviceIDs.Add([]flux.ResourceID{r.ResourceID()})
 	}
 
-	notes, err := s.getNotes(ctx)
+	notes, err := getNotes(ctx, s)
 	if err != nil {
 		return err
 	}
-	noteEvents, includesEvents, err := s.collectNoteEvents(ctx, notes, started)
+	noteEvents, includesEvents, err := collectNoteEvents(ctx, s, c, notes)
 	if err != nil {
 		return err
 	}
 
-	if err := s.logCommitEvent(serviceIDs, started, includesEvents, resourceErrors); err != nil {
+	if err := logCommitEvent(s, c, serviceIDs, includesEvents, resourceErrors); err != nil {
 		return err
 	}
 
@@ -102,12 +143,12 @@ func (s *Sync) Run(ctx context.Context) (retErr error) {
 		}
 	}
 
-	if s.newTagRev != s.oldTagRev {
-		if err := s.moveSyncTag(ctx); err != nil {
+	if c.newTagRev != c.oldTagRev {
+		if err := moveSyncTag(ctx, s, c, synctag); err != nil {
 			return err
 		}
-		s.logger.Log("tag", s.GitConfig.SyncTag, "old", s.oldTagRev, "new", s.newTagRev)
-		if err := s.refresh(ctx); err != nil {
+		s.logger.Log("tag", s.gitConfig.SyncTag, "old", c.oldTagRev, "new", c.newTagRev)
+		if err := refresh(ctx, s); err != nil {
 			return err
 		}
 	}
@@ -115,57 +156,39 @@ func (s *Sync) Run(ctx context.Context) (retErr error) {
 	return nil
 }
 
-// checkout checks out a working clone used for this sync.
-func (s *Sync) checkout(ctx context.Context) error {
+// getChangeset returns the changeset of commits for this sync,
+// including the revision range and if it is an initial sync.
+func getChangeset(ctx context.Context, s *Sync) (changeset, error) {
+	var c changeset
 	var err error
-	ctx, cancel := context.WithTimeout(ctx, s.GitOpTimeout)
-	s.working, err = s.Repo.Clone(ctx, s.GitConfig)
-	cancel()
-	return err
-}
 
-// loadTagRevision retrieves the tag revision(s) for this sync.
-func (s *Sync) loadTagRevisions(ctx context.Context) error {
-	var err error
-	s.oldTagRev, err = s.working.SyncRevision(ctx)
+	c.oldTagRev, err = s.working.SyncRevision(ctx)
 	if err != nil && !isUnknownRevision(err) {
-		return err
+		return c, err
+	}
+	c.newTagRev, err = s.working.HeadRevision(ctx)
+	if err != nil {
+		return c, err
 	}
 
-	// Check if something other than the current instance of fluxd changed the sync tag.
-	// This is likely to be caused by another fluxd instance using the same tag.
-	// Having multiple instances fighting for the same tag can lead to fluxd missing manifest changes.
-	if s.lastKnownSyncTagRev != "" && s.oldTagRev != s.lastKnownSyncTagRev && !s.warnedAboutSyncTagChange {
-		s.logger.Log("warning",
-			"detected external change in git sync tag; the sync tag should not be shared by fluxd instances")
-		s.warnedAboutSyncTagChange = true
-	}
-
-	s.newTagRev, err = s.working.HeadRevision(ctx)
-	return err
-}
-
-// loadCommitChangeset retrieves the commit changeset for this sync.
-func (s *Sync) loadCommitChangeset(ctx context.Context) error {
-	var err error
-	ctx, cancel := context.WithTimeout(ctx, s.GitOpTimeout)
-	if s.oldTagRev != "" {
-		s.commits, err = s.Repo.CommitsBetween(ctx, s.oldTagRev, s.newTagRev, s.GitConfig.Paths...)
+	ctx, cancel := context.WithTimeout(ctx, s.gitConfig.Timeout)
+	if c.oldTagRev != "" {
+		c.commits, err = s.repo.CommitsBetween(ctx, c.oldTagRev, c.newTagRev, s.gitConfig.Paths...)
 	} else {
-		s.initialSync = true
-		s.commits, err = s.Repo.CommitsBefore(ctx, s.newTagRev, s.GitConfig.Paths...)
+		c.initialSync = true
+		c.commits, err = s.repo.CommitsBefore(ctx, c.newTagRev, s.gitConfig.Paths...)
 	}
 	cancel()
-	return err
+
+	return c, err
 }
 
 // verifySyncTagSignature verifies the signature of the current sync
 // tag, if verification fails _while we are not doing an initial sync_
-// it blocks image polling and returns an error.
-func (s *Sync) verifySyncTagSignature(ctx context.Context) error {
-	err := s.working.VerifySyncTag(ctx)
-	if !s.initialSync && err != nil {
-		s.blockImagePolling(true)
+// it returns an error.
+func verifySyncTagSignature(ctx context.Context, working *git.Checkout, c changeset) error {
+	err := working.VerifySyncTag(ctx)
+	if !c.initialSync && err != nil {
 		return errors.Wrap(err, "failed to verify signature of sync tag")
 	}
 	return nil
@@ -174,14 +197,17 @@ func (s *Sync) verifySyncTagSignature(ctx context.Context) error {
 // verifyCommitSignatures verifies the signatures of the commits we are
 // working with, it does so by looping through the commits in ascending
 // order and requesting the validity of each signature. In case of
-// failure it blocks image polling, mutates the set of the commits we
-// are working with to the ones we have validated and returns an error.
-func (s *Sync) verifyCommitSignatures() error {
-	for i := len(s.commits) - 1; i >= 0; i-- {
-		if !s.commits[i].Signature.Valid() {
-			s.blockImagePolling(true)
-			s.commits = s.commits[i+1:]
-			return fmt.Errorf("invalid GPG signature for commit %s with key %s", s.commits[i].Revision, s.commits[i].Signature.Key)
+// failure it mutates the set of the changeset of commits we are
+// working with to the ones we have validated and returns an error.
+func verifyCommitSignatures(c *changeset) error {
+	for i := len(c.commits) - 1; i >= 0; i-- {
+		if !c.commits[i].Signature.Valid() {
+			c.commits = c.commits[i+1:]
+			return fmt.Errorf(
+				"invalid GPG signature for commit %s with key %s",
+				c.commits[i].Revision,
+				c.commits[i].Signature.Key,
+			)
 		}
 	}
 	return nil
@@ -191,17 +217,18 @@ func (s *Sync) verifyCommitSignatures() error {
 // repository and newTagRev is still equal to the commit changeset we
 // have. This is required when working with GPG signatures as we may
 // be working with a mutated commit changeset due to commit signature
-// verification errors.
-func (s *Sync) verifyWorkingState(ctx context.Context) error {
+// verification errors. It returns true if the state is secure to work
+// with.
+func verifyWorkingState(ctx context.Context, working *git.Checkout, c *changeset) (bool, error) {
 	// We have no valid commits, determine what we should do next...
-	if len(s.commits) == 0 {
+	if len(c.commits) == 0 {
 		// We have no state to reapply either; abort...
-		if s.initialSync {
-			return errors.New("unable to sync as no commits with valid GPG signatures were found")
+		if c.initialSync {
+			return false, errors.New("unable to sync as no commits with valid GPG signatures were found")
 		}
 		// Reapply the old rev as this is the latest valid state we saw
-		s.newTagRev = s.oldTagRev
-		return nil
+		c.newTagRev = c.oldTagRev
+		return false, nil
 	}
 
 	// Check if the first commit in the slice still equals the
@@ -209,29 +236,26 @@ func (s *Sync) verifyWorkingState(ctx context.Context) error {
 	// the working clone to the revision of the commit from the
 	// slice as otherwise we will be (re)applying unverified
 	// state on the cluster.
-	if latestCommitRev := s.commits[len(s.commits)-1].Revision; s.newTagRev != latestCommitRev {
-		if err := s.working.Checkout(ctx, latestCommitRev); err != nil {
-			return err
+	if latestCommitRev := c.commits[len(c.commits)-1].Revision; c.newTagRev != latestCommitRev {
+		if err := working.Checkout(ctx, latestCommitRev); err != nil {
+			return false, err
 		}
-		s.newTagRev = latestCommitRev
-		return nil
+		c.newTagRev = latestCommitRev
+		return false, nil
 	}
-	// All verification succeeded. Make sure we are no longer block
-	// image polling.
-	s.blockImagePolling(false)
-	return nil
+	return true, nil
 }
 
 // doSync runs the actual sync of workloads on the cluster. It returns
 // a map with all resources it applied and sync errors it encountered.
-func (s *Sync) doSync(syncSetName string) (map[string]resource.Resource, []event.ResourceError, error) {
-	resources, err := s.Manifests.LoadManifests(s.working.Dir(), s.working.ManifestDirs())
+func doSync(s *Sync, syncSetName string) (map[string]resource.Resource, []event.ResourceError, error) {
+	resources, err := s.manifests.LoadManifests(s.working.Dir(), s.working.ManifestDirs())
 	if err != nil {
 		return nil, nil, errors.Wrap(err, "loading resources from repo")
 	}
 
 	var resourceErrors []event.ResourceError
-	if err := fluxsync.Sync(syncSetName, resources, s.Cluster); err != nil {
+	if err := fluxsync.Sync(syncSetName, resources, s.cluster); err != nil {
 		s.logger.Log("err", err)
 		switch syncerr := err.(type) {
 		case cluster.SyncError:
@@ -249,19 +273,19 @@ func (s *Sync) doSync(syncSetName string) (map[string]resource.Resource, []event
 	return resources, resourceErrors, nil
 }
 
-// getChangedResources returns what resources are modified during this
-// sync.
-func (s *Sync) getChangedResources(ctx context.Context, resources map[string]resource.Resource) (map[string]resource.Resource, error) {
-	if s.initialSync {
+// getChangedResources calculates what resources are modified during
+// this sync.
+func getChangedResources(ctx context.Context, s *Sync, c changeset, resources map[string]resource.Resource) (map[string]resource.Resource, error) {
+	if c.initialSync {
 		return resources, nil
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, s.GitOpTimeout)
-	changedFiles, err := s.working.ChangedFiles(ctx, s.oldTagRev)
+	ctx, cancel := context.WithTimeout(ctx, s.gitConfig.Timeout)
+	changedFiles, err := s.working.ChangedFiles(ctx, c.oldTagRev)
 	if err == nil && len(changedFiles) > 0 {
 		// We had some changed files, we're syncing a diff
 		// FIXME(michael): this won't be accurate when a file can have more than one resource
-		resources, err = s.Manifests.LoadManifests(s.working.Dir(), changedFiles)
+		resources, err = s.manifests.LoadManifests(s.working.Dir(), changedFiles)
 	}
 	cancel()
 	if err != nil {
@@ -271,8 +295,8 @@ func (s *Sync) getChangedResources(ctx context.Context, resources map[string]res
 }
 
 // getNotes retrieves the git notes from the working clone.
-func (s *Sync) getNotes(ctx context.Context) (map[string]struct{}, error) {
-	ctx, cancel := context.WithTimeout(ctx, s.GitOpTimeout)
+func getNotes(ctx context.Context, s *Sync) (map[string]struct{}, error) {
+	ctx, cancel := context.WithTimeout(ctx, s.gitConfig.Timeout)
 	notes, err := s.working.NoteRevList(ctx)
 	cancel()
 	if err != nil {
@@ -286,8 +310,8 @@ func (s *Sync) getNotes(ctx context.Context) (map[string]struct{}, error) {
 // of what other things this sync includes e.g., releases and
 // autoreleases, that we're already posting as events, so upstream
 // can skip the sync event if it wants to.
-func (s *Sync) collectNoteEvents(ctx context.Context, notes map[string]struct{}, started time.Time) ([]event.Event, map[string]bool, error) {
-	if len(s.commits) == 0 {
+func collectNoteEvents(ctx context.Context, s *Sync, c changeset, notes map[string]struct{}) ([]event.Event, map[string]bool, error) {
+	if len(c.commits) == 0 {
 		return nil, nil, nil
 	}
 
@@ -295,14 +319,14 @@ func (s *Sync) collectNoteEvents(ctx context.Context, notes map[string]struct{},
 	var eventTypes map[string]bool
 
 	// Find notes in revisions.
-	for i := len(s.commits) - 1; i >= 0; i-- {
-		if _, ok := notes[s.commits[i].Revision]; !ok {
+	for i := len(c.commits) - 1; i >= 0; i-- {
+		if _, ok := notes[c.commits[i].Revision]; !ok {
 			eventTypes[event.NoneOfTheAbove] = true
 			continue
 		}
-		ctx, cancel := context.WithTimeout(ctx, s.GitOpTimeout)
 		var n note
-		ok, err := s.working.GetNote(ctx, s.commits[i].Revision, &n)
+		ctx, cancel := context.WithTimeout(ctx, s.gitConfig.Timeout)
+		ok, err := s.working.GetNote(ctx, c.commits[i].Revision, &n)
 		cancel()
 		if err != nil {
 			return nil, nil, errors.Wrap(err, "loading notes from repo")
@@ -321,7 +345,7 @@ func (s *Sync) collectNoteEvents(ctx context.Context, notes map[string]struct{},
 		// different tag). Either way, we don't want to report any
 		// notes on an initial sync, since they (most likely)
 		// don't belong to us.
-		if s.initialSync {
+		if c.initialSync {
 			s.logger.Log("warning", "no notes expected on initial sync; this repo may be in use by another fluxd")
 			return noteEvents, eventTypes, nil
 		}
@@ -333,12 +357,12 @@ func (s *Sync) collectNoteEvents(ctx context.Context, notes map[string]struct{},
 			noteEvents = append(noteEvents, event.Event{
 				ServiceIDs: n.Result.AffectedResources(),
 				Type:       event.EventRelease,
-				StartedAt:  started,
+				StartedAt:  s.started,
 				EndedAt:    time.Now().UTC(),
 				LogLevel:   event.LogLevelInfo,
 				Metadata: &event.ReleaseEventMetadata{
 					ReleaseEventCommon: event.ReleaseEventCommon{
-						Revision: s.commits[i].Revision,
+						Revision: c.commits[i].Revision,
 						Result:   n.Result,
 						Error:    n.Result.Error(),
 					},
@@ -355,12 +379,12 @@ func (s *Sync) collectNoteEvents(ctx context.Context, notes map[string]struct{},
 			noteEvents = append(noteEvents, event.Event{
 				ServiceIDs: n.Result.AffectedResources(),
 				Type:       event.EventRelease,
-				StartedAt:  started,
+				StartedAt:  s.started,
 				EndedAt:    time.Now().UTC(),
 				LogLevel:   event.LogLevelInfo,
 				Metadata: &event.ReleaseEventMetadata{
 					ReleaseEventCommon: event.ReleaseEventCommon{
-						Revision: s.commits[i].Revision,
+						Revision: c.commits[i].Revision,
 						Result:   n.Result,
 						Error:    n.Result.Error(),
 					},
@@ -377,12 +401,12 @@ func (s *Sync) collectNoteEvents(ctx context.Context, notes map[string]struct{},
 			noteEvents = append(noteEvents, event.Event{
 				ServiceIDs: n.Result.AffectedResources(),
 				Type:       event.EventAutoRelease,
-				StartedAt:  started,
+				StartedAt:  s.started,
 				EndedAt:    time.Now().UTC(),
 				LogLevel:   event.LogLevelInfo,
 				Metadata: &event.AutoReleaseEventMetadata{
 					ReleaseEventCommon: event.ReleaseEventCommon{
-						Revision: s.commits[i].Revision,
+						Revision: c.commits[i].Revision,
 						Result:   n.Result,
 						Error:    n.Result.Error(),
 					},
@@ -403,22 +427,22 @@ func (s *Sync) collectNoteEvents(ctx context.Context, notes map[string]struct{},
 }
 
 // logCommitEvent reports all synced commits to the upstream.
-func (s *Sync) logCommitEvent(serviceIDs flux.ResourceIDSet, started time.Time,
+func logCommitEvent(s *Sync, c changeset, serviceIDs flux.ResourceIDSet,
 	includesEvents map[string]bool, resourceErrors []event.ResourceError) error {
-	cs := make([]event.Commit, len(s.commits))
-	for i, c := range s.commits {
-		cs[i].Revision = c.Revision
-		cs[i].Message = c.Message
+	cs := make([]event.Commit, len(c.commits))
+	for i, ci := range c.commits {
+		cs[i].Revision = ci.Revision
+		cs[i].Message = ci.Message
 	}
 	if err := s.LogEvent(event.Event{
 		ServiceIDs: serviceIDs.ToSlice(),
 		Type:       event.EventSync,
-		StartedAt:  started,
-		EndedAt:    started,
+		StartedAt:  s.started,
+		EndedAt:    s.started,
 		LogLevel:   event.LogLevelInfo,
 		Metadata: &event.SyncEventMetadata{
 			Commits:     cs,
-			InitialSync: s.initialSync,
+			InitialSync: c.initialSync,
 			Includes:    includesEvents,
 			Errors:      resourceErrors,
 		},
@@ -430,38 +454,27 @@ func (s *Sync) logCommitEvent(serviceIDs flux.ResourceIDSet, started time.Time,
 }
 
 // moveSyncTag moves the sync tag to the revision we just synced.
-func (s *Sync) moveSyncTag(ctx context.Context) error {
-	ctx, cancel := context.WithTimeout(ctx, s.GitOpTimeout)
+func moveSyncTag(ctx context.Context, s *Sync, c changeset, synctag SyncTag) error {
 	tagAction := git.TagAction{
-		Revision: s.newTagRev,
+		Revision: c.newTagRev,
 		Message:  "Sync pointer",
 	}
-	err := s.working.MoveSyncTagAndPush(ctx, tagAction)
-	cancel()
-	if err != nil {
+	ctx, cancel := context.WithTimeout(ctx, s.gitConfig.Timeout)
+	if err := s.working.MoveSyncTagAndPush(ctx, tagAction); err != nil {
 		return err
 	}
-	s.lastKnownSyncTagRev = s.newTagRev
+	cancel()
+	synctag.SetRevision(c.newTagRev)
 	return nil
 }
 
 // refresh refreshes the repository, notifying the daemon we have a new
 // sync head.
-func (s *Sync) refresh(ctx context.Context) error {
-	ctx, cancel := context.WithTimeout(ctx, s.GitOpTimeout)
-	err := s.Repo.Refresh(ctx)
+func refresh(ctx context.Context, s *Sync) error {
+	ctx, cancel := context.WithTimeout(ctx, s.gitConfig.Timeout)
+	err := s.repo.Refresh(ctx)
 	cancel()
 	return err
-}
-
-// Blocks image updates, this should happen when an invalid signature
-// was found because of two reasons:
-// 1. we would apply updates on top of something we do not see as
-//    valid, _indirectly_ giving it more authenticity
-// 2. the pushed updates would never reach the cluster as we will
-//    never get past the invalid commit we just encountered
-func (s *Sync) blockImagePolling(block bool) {
-	s.blockImagePoll = block
 }
 
 func isUnknownRevision(err error) bool {

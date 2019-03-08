@@ -434,15 +434,17 @@ func main() {
 
 	gitRemote := git.Remote{URL: *gitURL}
 	gitConfig := git.Config{
-		Paths:       *gitPath,
-		Branch:      *gitBranch,
-		SyncTag:     *gitSyncTag,
-		NotesRef:    *gitNotesRef,
-		UserName:    *gitUser,
-		UserEmail:   *gitEmail,
-		SigningKey:  *gitSigningKey,
-		SetAuthor:   *gitSetAuthor,
-		SkipMessage: *gitSkipMessage,
+		Paths:            *gitPath,
+		Branch:           *gitBranch,
+		SyncTag:          *gitSyncTag,
+		NotesRef:         *gitNotesRef,
+		UserName:         *gitUser,
+		UserEmail:        *gitEmail,
+		SigningKey:       *gitSigningKey,
+		VerifySignatures: *gitVerifySignatures,
+		SetAuthor:        *gitSetAuthor,
+		SkipMessage:      *gitSkipMessage,
+		Timeout:          *gitTimeout,
 	}
 
 	repo := git.NewRepo(gitRemote, git.PollInterval(*gitPollInterval), git.Timeout(*gitTimeout))
@@ -485,8 +487,6 @@ func main() {
 		LoopVars: &daemon.LoopVars{
 			SyncInterval:         *syncInterval,
 			RegistryPollInterval: *registryPollInterval,
-			GitOpTimeout:         *gitTimeout,
-			GitVerifySignatures:  *gitVerifySignatures,
 		},
 	}
 

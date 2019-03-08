@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 var (
@@ -14,15 +15,17 @@ var (
 // Config holds some values we use when working in the working clone of
 // a repo.
 type Config struct {
-	Branch      string   // branch we're syncing to
-	Paths       []string // paths within the repo containing files we care about
-	SyncTag     string
-	NotesRef    string
-	UserName    string
-	UserEmail   string
-	SigningKey  string
-	SetAuthor   bool
-	SkipMessage string
+	Branch           string   // branch we're syncing to
+	Paths            []string // paths within the repo containing files we care about
+	SyncTag          string
+	NotesRef         string
+	UserName         string
+	UserEmail        string
+	SigningKey       string
+	VerifySignatures bool
+	SetAuthor        bool
+	SkipMessage      string
+	Timeout          time.Duration
 }
 
 // Checkout is a local working clone of the remote repo. It is
