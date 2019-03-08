@@ -14,7 +14,6 @@ import (
 	"github.com/weaveworks/flux/cluster"
 	"github.com/weaveworks/flux/event"
 	"github.com/weaveworks/flux/git"
-	fluxmetrics "github.com/weaveworks/flux/metrics"
 	"github.com/weaveworks/flux/resource"
 	fluxsync "github.com/weaveworks/flux/sync"
 	"github.com/weaveworks/flux/update"
@@ -71,14 +70,9 @@ func (d *Daemon) NewSync(logger log.Logger) (Sync, error) {
 }
 
 // Run starts the synchronization of the cluster with git.
-func (s *Sync) Run(ctx context.Context, synctag SyncTag, imagePollLock ImagePollLock) (retErr error) {
+func (s *Sync) Run(ctx context.Context, synctag SyncTag, imagePollLock ImagePollLock) error {
 	s.started = time.Now().UTC()
 	defer s.working.Clean()
-	defer func() {
-		syncDuration.With(
-			fluxmetrics.LabelSuccess, fmt.Sprint(retErr == nil),
-		).Observe(time.Since(s.started).Seconds())
-	}()
 
 	c, err := getChangeset(ctx, s)
 	if err != nil {
