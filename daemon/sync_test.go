@@ -100,15 +100,14 @@ func TestRun_InitialSync(t *testing.T) {
 		seedInvalidCommit bool
 
 		expectRunError      bool
-		expectImagePollLock bool
 		expectSyncCalled    bool
 		expectSyncTagChange bool
 	}{
-		"default": {defaultGitConfig, false, false, false, false, false, true, true},
-		"signed commits without signature verification":     {defaultGitConfig, true, false, false, false, false, true, true},
-		"signed commits with signature verification":        {defaultGitConfig, true, true, false, false, false, true, true},
-		"unsigned commits with signature verification":      {defaultGitConfig, false, true, false, true, true, false, false},
-		"invalid signed commit with signature verification": {defaultGitConfig, true, true, true, false, true, true, true},
+		"default": {defaultGitConfig, false, false, false, false, true, true},
+		"signed commits without signature verification":     {defaultGitConfig, true, false, false, false, true, true},
+		"signed commits with signature verification":        {defaultGitConfig, true, true, false, false, true, true},
+		"unsigned commits with signature verification":      {defaultGitConfig, false, true, false, true, false, false},
+		"invalid signed commit with signature verification": {defaultGitConfig, true, true, true, false, true, true},
 	}
 	for name, tc := range testCases {
 		s, cleanup := setupSync(t, tc.gitConfig, tc.signCommits, tc.verifySignatures)
@@ -169,20 +168,14 @@ func TestRun_InitialSync(t *testing.T) {
 			}
 		}
 
-		syncTag := lastKnownSyncTag{}
-		lock := imagePollLock{}
+		syncTag := lastKnownSyncTag{logger: s.logger, syncTag: s.gitConfig.SyncTag}
 
 		// It (does not) return(s) err on run
-		err := s.Run(context.Background(), &syncTag, &lock)
+		err := s.Run(context.Background(), &syncTag)
 		if tc.expectRunError && err == nil {
 			t.Errorf("%s: expected err on run but did not get one", name)
 		} else if !tc.expectRunError && err != nil {
 			t.Errorf("%s: expected no err on run but got: %v", name, err)
-		}
-
-		// It (does not) lock(s) image polling
-		if lock.Locked() != tc.expectImagePollLock {
-			t.Errorf("%s: expected lock to be %t but was %t", name, tc.expectImagePollLock, lock.Locked())
 		}
 
 		// It (does not) sync(s) to the cluster

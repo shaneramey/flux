@@ -48,11 +48,7 @@ func (d *Daemon) Loop(stop chan struct{}, wg *sync.WaitGroup, logger log.Logger)
 
 	for {
 		var (
-			lastKnownSyncTag = &lastKnownSyncTag{}
-			// If the verification of git signatures is enabled we
-			// want to disable the updates of images until we have
-			// verified the state of the git repository can be trusted.
-			imagePollLock = &imagePollLock{d.GitConfig.VerifySignatures}
+			lastKnownSyncTag = &lastKnownSyncTag{logger: logger, syncTag: d.GitConfig.SyncTag}
 		)
 		select {
 		case <-stop:
@@ -65,7 +61,7 @@ func (d *Daemon) Loop(stop chan struct{}, wg *sync.WaitGroup, logger log.Logger)
 				default:
 				}
 			}
-			d.pollForNewImages(logger, imagePollLock)
+			d.pollForNewImages(logger)
 			imagePollTimer.Reset(d.RegistryPollInterval)
 		case <-imagePollTimer.C:
 			d.AskForImagePoll()
@@ -81,7 +77,7 @@ func (d *Daemon) Loop(stop chan struct{}, wg *sync.WaitGroup, logger log.Logger)
 				logger.Log("err", err)
 				continue
 			}
-			err = sync.Run(context.Background(), lastKnownSyncTag, imagePollLock)
+			err = sync.Run(context.Background(), lastKnownSyncTag)
 			syncDuration.With(
 				fluxmetrics.LabelSuccess, fmt.Sprint(err == nil),
 			).Observe(time.Since(sync.started).Seconds())
@@ -151,6 +147,8 @@ func (d *LoopVars) AskForImagePoll() {
 
 // -- internals to keep track of sync tag state
 type lastKnownSyncTag struct {
+	logger            log.Logger
+	syncTag           string
 	revision          string
 	warnedAboutChange bool
 }
@@ -159,27 +157,17 @@ func (s *lastKnownSyncTag) Revision() string {
 	return s.revision
 }
 
-func (s *lastKnownSyncTag) SetRevision(rev string) {
-	s.revision = rev
-}
+func (s *lastKnownSyncTag) SetRevision(oldRev, newRev string) {
+	// Check if something other than the current instance of fluxd
+	// changed the sync tag. This is likely caused by another instace
+	// using the same tag. Having multiple instances fight for the same
+	// tag can lead to fluxd missing manifest changes.
+	if s.revision != "" && oldRev != s.revision && !s.warnedAboutChange {
+		s.logger.Log("warning",
+			"detected external change in git sync tag; the sync tag should not be shared by fluxd instances")
+		s.warnedAboutChange = true
+	}
 
-func (s *lastKnownSyncTag) WarnedAboutChange() bool {
-	return s.warnedAboutChange
-}
-
-func (s *lastKnownSyncTag) SetWarnedAboutChange(warned bool) {
-	s.warnedAboutChange = warned
-}
-
-// -- internals to lock the polling of images
-type imagePollLock struct {
-	locked bool
-}
-
-func (l *imagePollLock) Locked() bool {
-	return l.locked
-}
-
-func (l *imagePollLock) Lock(b bool) {
-	l.locked = b
+	s.logger.Log("tag", s.syncTag, "old", oldRev, "new", newRev)
+	s.revision = newRev
 }

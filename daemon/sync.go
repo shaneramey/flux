@@ -33,9 +33,7 @@ type Sync struct {
 
 type SyncTag interface {
 	Revision() string
-	SetRevision(rev string)
-	WarnedAboutChange() bool
-	SetWarnedAboutChange(warned bool)
+	SetRevision(oldRev, NewRev string)
 }
 
 type eventLogger interface {
@@ -70,36 +68,23 @@ func (d *Daemon) NewSync(logger log.Logger) (Sync, error) {
 }
 
 // Run starts the synchronization of the cluster with git.
-func (s *Sync) Run(ctx context.Context, synctag SyncTag, imagePollLock ImagePollLock) error {
+func (s *Sync) Run(ctx context.Context, synctag SyncTag) error {
 	s.started = time.Now().UTC()
 	defer s.working.Clean()
 
-	c, err := getChangeset(ctx, s)
+	c, err := getChangeset(ctx, s.working, s.repo, s.gitConfig)
 	if err != nil {
 		return err
 	}
 
-	// Check if something other than the current instance of fluxd changed the sync tag.
-	// This is likely to be caused by another fluxd instance using the same tag.
-	// Having multiple instances fighting for the same tag can lead to fluxd missing manifest changes.
-	if synctag.Revision() != "" && c.oldTagRev != synctag.Revision() && !synctag.WarnedAboutChange() {
-		s.logger.Log("warning",
-			"detected external change in git sync tag; the sync tag should not be shared by fluxd instances")
-		synctag.SetWarnedAboutChange(true)
-	}
-
 	if s.gitConfig.VerifySignatures {
 		if err := verifySyncTagSignature(ctx, s.working, c); err != nil {
-			imagePollLock.Lock(true)
 			return err
 		}
 		if err = verifyCommitSignatures(&c); err != nil {
-			imagePollLock.Lock(true)
 			s.logger.Log("err", err)
 		}
-		ok, err := verifyWorkingState(ctx, s.working, &c)
-		imagePollLock.Lock(!ok)
-		if err != nil {
+		if err := verifyWorkingState(ctx, s.working, &c); err != nil {
 			return err
 		}
 	}
@@ -141,7 +126,7 @@ func (s *Sync) Run(ctx context.Context, synctag SyncTag, imagePollLock ImagePoll
 		if err := moveSyncTag(ctx, s, c, synctag); err != nil {
 			return err
 		}
-		s.logger.Log("tag", s.gitConfig.SyncTag, "old", c.oldTagRev, "new", c.newTagRev)
+		synctag.SetRevision(c.oldTagRev, c.newTagRev)
 		if err := refresh(ctx, s); err != nil {
 			return err
 		}
@@ -152,25 +137,25 @@ func (s *Sync) Run(ctx context.Context, synctag SyncTag, imagePollLock ImagePoll
 
 // getChangeset returns the changeset of commits for this sync,
 // including the revision range and if it is an initial sync.
-func getChangeset(ctx context.Context, s *Sync) (changeset, error) {
+func getChangeset(ctx context.Context, working *git.Checkout, repo *git.Repo, gitConfig git.Config) (changeset, error) {
 	var c changeset
 	var err error
 
-	c.oldTagRev, err = s.working.SyncRevision(ctx)
+	c.oldTagRev, err = working.SyncRevision(ctx)
 	if err != nil && !isUnknownRevision(err) {
 		return c, err
 	}
-	c.newTagRev, err = s.working.HeadRevision(ctx)
+	c.newTagRev, err = working.HeadRevision(ctx)
 	if err != nil {
 		return c, err
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, s.gitConfig.Timeout)
+	ctx, cancel := context.WithTimeout(ctx, gitConfig.Timeout)
 	if c.oldTagRev != "" {
-		c.commits, err = s.repo.CommitsBetween(ctx, c.oldTagRev, c.newTagRev, s.gitConfig.Paths...)
+		c.commits, err = repo.CommitsBetween(ctx, c.oldTagRev, c.newTagRev, gitConfig.Paths...)
 	} else {
 		c.initialSync = true
-		c.commits, err = s.repo.CommitsBefore(ctx, c.newTagRev, s.gitConfig.Paths...)
+		c.commits, err = repo.CommitsBefore(ctx, c.newTagRev, gitConfig.Paths...)
 	}
 	cancel()
 
@@ -181,8 +166,10 @@ func getChangeset(ctx context.Context, s *Sync) (changeset, error) {
 // tag, if verification fails _while we are not doing an initial sync_
 // it returns an error.
 func verifySyncTagSignature(ctx context.Context, working *git.Checkout, c changeset) error {
-	err := working.VerifySyncTag(ctx)
-	if !c.initialSync && err != nil {
+	if c.initialSync {
+		return nil
+	}
+	if err := working.VerifySyncTag(ctx); err != nil {
 		return errors.Wrap(err, "failed to verify signature of sync tag")
 	}
 	return nil
@@ -212,18 +199,17 @@ func verifyCommitSignatures(c *changeset) error {
 // repository and newTagRev is still equal to the commit changeset we
 // have. This is required when working with GPG signatures as we may
 // be working with a mutated commit changeset due to commit signature
-// verification errors. It returns true if the state is secure to work
-// with.
-func verifyWorkingState(ctx context.Context, working *git.Checkout, c *changeset) (bool, error) {
+// verification errors.
+func verifyWorkingState(ctx context.Context, working *git.Checkout, c *changeset) error {
 	// We have no valid commits, determine what we should do next...
 	if len(c.commits) == 0 {
 		// We have no state to reapply either; abort...
 		if c.initialSync {
-			return false, errors.New("unable to sync as no commits with valid GPG signatures were found")
+			return errors.New("unable to sync as no commits with valid GPG signatures were found")
 		}
 		// Reapply the old rev as this is the latest valid state we saw
 		c.newTagRev = c.oldTagRev
-		return false, nil
+		return nil
 	}
 
 	// Check if the first commit in the slice still equals the
@@ -233,12 +219,12 @@ func verifyWorkingState(ctx context.Context, working *git.Checkout, c *changeset
 	// state on the cluster.
 	if latestCommitRev := c.commits[len(c.commits)-1].Revision; c.newTagRev != latestCommitRev {
 		if err := working.Checkout(ctx, latestCommitRev); err != nil {
-			return false, err
+			return err
 		}
 		c.newTagRev = latestCommitRev
-		return false, nil
+		return nil
 	}
-	return true, nil
+	return nil
 }
 
 // doSync runs the actual sync of workloads on the cluster. It returns
@@ -459,7 +445,6 @@ func moveSyncTag(ctx context.Context, s *Sync, c changeset, synctag SyncTag) err
 		return err
 	}
 	cancel()
-	synctag.SetRevision(c.newTagRev)
 	return nil
 }
 

@@ -426,6 +426,18 @@ func (d *Daemon) updatePolicy(spec update.Spec, updates policy.Updates) updateFu
 			Author:  commitAuthor,
 			Message: policyCommitMessage(updates, spec.Cause),
 		}
+		if d.GitConfig.VerifySignatures {
+			cs, err := getChangeset(ctx, working, d.Repo, d.GitConfig)
+			if err != nil {
+				return result, err
+			}
+			if err = verifySyncTagSignature(ctx, working, cs); err != nil {
+				return result, err
+			}
+			if err = verifyCommitSignatures(&cs); err != nil {
+				return result, err
+			}
+		}
 		if err := working.CommitAndPush(ctx, commitAction, &note{JobID: jobID, Spec: spec}); err != nil {
 			// On the chance pushing failed because it was not
 			// possible to fast-forward, ask for a sync so the
@@ -470,6 +482,18 @@ func (d *Daemon) release(spec update.Spec, c release.Changes) updateFunc {
 			commitAction := git.CommitAction{
 				Author:  commitAuthor,
 				Message: commitMsg,
+			}
+			if d.GitConfig.VerifySignatures {
+				cs, err := getChangeset(ctx, working, d.Repo, d.GitConfig)
+				if err != nil {
+					return zero, err
+				}
+				if err = verifySyncTagSignature(ctx, working, cs); err != nil {
+					return zero, err
+				}
+				if err = verifyCommitSignatures(&cs); err != nil {
+					return zero, err
+				}
 			}
 			if err := working.CommitAndPush(ctx, commitAction, &note{JobID: jobID, Spec: spec, Result: result}); err != nil {
 				// On the chance pushing failed because it was not

@@ -13,17 +13,7 @@ import (
 	"github.com/weaveworks/flux/update"
 )
 
-type ImagePollLock interface {
-	Locked() bool
-	Lock(b bool)
-}
-
-func (d *Daemon) pollForNewImages(logger log.Logger, imagePollLock ImagePollLock) {
-	if imagePollLock.Locked() {
-		logger.Log("error", "image polling is blocked")
-		return
-	}
-
+func (d *Daemon) pollForNewImages(logger log.Logger) {
 	logger.Log("msg", "polling images")
 
 	ctx := context.Background()
