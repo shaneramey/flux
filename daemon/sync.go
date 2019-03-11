@@ -21,13 +21,13 @@ import (
 
 // Sync holds the data we are working with during a sync.
 type Sync struct {
-	started		time.Time
-	logger      log.Logger
-	working     *git.Checkout
-	repo        *git.Repo
-	gitConfig   git.Config
-	manifests   cluster.Manifests
-	cluster		cluster.Cluster
+	started   time.Time
+	logger    log.Logger
+	working   *git.Checkout
+	repo      *git.Repo
+	gitConfig git.Config
+	manifests cluster.Manifests
+	cluster   cluster.Cluster
 	eventLogger
 }
 
@@ -52,18 +52,18 @@ type changeset struct {
 // NewSync initializes a new sync.
 func (d *Daemon) NewSync(logger log.Logger) (Sync, error) {
 	s := Sync{
-		logger: logger,
-		repo: d.Repo,
-		gitConfig: d.GitConfig,
-		manifests: d.Manifests,
-		cluster: d.Cluster,
+		logger:      logger,
+		repo:        d.Repo,
+		gitConfig:   d.GitConfig,
+		manifests:   d.Manifests,
+		cluster:     d.Cluster,
 		eventLogger: d,
 	}
 
 	// checkout out a working clone used for this sync.
 	var err error
 	ctx, cancel := context.WithTimeout(context.Background(), s.gitConfig.Timeout)
-	s.working, err = s.repo.Clone(ctx, s.gitConfig); 
+	s.working, err = s.repo.Clone(ctx, s.gitConfig)
 	cancel()
 
 	return s, err
@@ -196,12 +196,13 @@ func verifySyncTagSignature(ctx context.Context, working *git.Checkout, c change
 func verifyCommitSignatures(c *changeset) error {
 	for i := len(c.commits) - 1; i >= 0; i-- {
 		if !c.commits[i].Signature.Valid() {
-			c.commits = c.commits[i+1:]
-			return fmt.Errorf(
+			err := fmt.Errorf(
 				"invalid GPG signature for commit %s with key %s",
 				c.commits[i].Revision,
 				c.commits[i].Signature.Key,
 			)
+			c.commits = c.commits[i+1:]
+			return err
 		}
 	}
 	return nil
@@ -310,7 +311,7 @@ func collectNoteEvents(ctx context.Context, s *Sync, c changeset, notes map[stri
 	}
 
 	var noteEvents []event.Event
-	var eventTypes map[string]bool
+	var eventTypes = make(map[string]bool)
 
 	// Find notes in revisions.
 	for i := len(c.commits) - 1; i >= 0; i-- {
