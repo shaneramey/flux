@@ -357,6 +357,11 @@ func (d *Daemon) sync() jobFunc {
 		if err != nil {
 			return result, err
 		}
+		if latestVerifiedRev, err := d.LatestValidRevision(ctx, head); err != nil {
+			return result, err
+		} else if head != latestVerifiedRev {
+			return result, fmt.Errorf("unable to sync to invalid HEAD revision (%s) latest verified revision is: %s", head, latestVerifiedRev)
+		}
 		result.Revision = head
 		return result, nil
 	}
@@ -418,6 +423,14 @@ func (d *Daemon) updatePolicy(spec update.Spec, updates policy.Updates) updateFu
 			return result, nil
 		}
 
+		if headRev, err := working.HeadRevision(ctx); err != nil {
+			return result, err
+		} else if latestVerifiedRev, err := d.LatestValidRevision(ctx, headRev); err != nil {
+			return result, err
+		} else if headRev != latestVerifiedRev {
+			return result, fmt.Errorf("HEAD is not a verified revision; can not update on top of unverified HEAD")
+		}
+
 		commitAuthor := ""
 		if d.GitConfig.SetAuthor {
 			commitAuthor = spec.Cause.User
@@ -425,18 +438,6 @@ func (d *Daemon) updatePolicy(spec update.Spec, updates policy.Updates) updateFu
 		commitAction := git.CommitAction{
 			Author:  commitAuthor,
 			Message: policyCommitMessage(updates, spec.Cause),
-		}
-		if d.GitConfig.VerifySignatures {
-			cs, err := getChangeset(ctx, working, d.Repo, d.GitConfig)
-			if err != nil {
-				return result, err
-			}
-			if err = verifySyncTagSignature(ctx, working, cs); err != nil {
-				return result, err
-			}
-			if err = verifyCommitSignatures(&cs); err != nil {
-				return result, err
-			}
 		}
 		if err := working.CommitAndPush(ctx, commitAction, &note{JobID: jobID, Spec: spec}); err != nil {
 			// On the chance pushing failed because it was not
@@ -471,6 +472,14 @@ func (d *Daemon) release(spec update.Spec, c release.Changes) updateFunc {
 		var revision string
 
 		if c.ReleaseKind() == update.ReleaseKindExecute {
+			if headRev, err := working.HeadRevision(ctx); err != nil {
+				return zero, err
+			} else if latestVerifiedRev, err := d.LatestValidRevision(ctx, headRev); err != nil {
+				return zero, err
+			} else if headRev != latestVerifiedRev {
+				return zero, fmt.Errorf("HEAD is not a verified revision; can not update on top of unverified HEAD")
+			}
+
 			commitMsg := spec.Cause.Message
 			if commitMsg == "" {
 				commitMsg = c.CommitMessage(result)
@@ -482,18 +491,6 @@ func (d *Daemon) release(spec update.Spec, c release.Changes) updateFunc {
 			commitAction := git.CommitAction{
 				Author:  commitAuthor,
 				Message: commitMsg,
-			}
-			if d.GitConfig.VerifySignatures {
-				cs, err := getChangeset(ctx, working, d.Repo, d.GitConfig)
-				if err != nil {
-					return zero, err
-				}
-				if err = verifySyncTagSignature(ctx, working, cs); err != nil {
-					return zero, err
-				}
-				if err = verifyCommitSignatures(&cs); err != nil {
-					return zero, err
-				}
 			}
 			if err := working.CommitAndPush(ctx, commitAction, &note{JobID: jobID, Spec: spec, Result: result}); err != nil {
 				// On the chance pushing failed because it was not
@@ -636,6 +633,50 @@ func (d *Daemon) WithClone(ctx context.Context, fn func(*git.Checkout) error) er
 	}
 	defer co.Clean()
 	return fn(co)
+}
+
+// LatestValidRevision returns the latest valid revision for the
+// configured branch when the verification of GPG signatures for Git
+// is enabled _or_ the HEAD revision of the configured branch when it
+// is not. In case verification is enabled and a current revision is
+// given it will also validate the tag signature -- as the state of
+// the branch can not be trusted when the tag originates from an
+// unknown source.
+func (d *Daemon) LatestValidRevision(ctx context.Context, currentRevision string) (string, error) {
+	newRevision, err := d.Repo.Revision(ctx, d.GitConfig.Branch)
+	if !d.GitConfig.VerifySignatures || err != nil {
+		return newRevision, err
+	}
+
+	if currentRevision != "" {
+		err = d.Repo.VerifyTag(ctx, d.GitConfig.SyncTag)
+		if err != nil {
+			return currentRevision, errors.Wrap(err, "failed to verify signature of sync tag")
+		}
+	}
+
+	var commits []git.Commit
+	if currentRevision == "" {
+		commits, err = d.Repo.CommitsBefore(ctx, newRevision)
+	} else {
+		commits, err = d.Repo.CommitsBetween(ctx, currentRevision, newRevision)
+	}
+
+	if err != nil {
+		return "", err
+	}
+
+	for i := len(commits) - 1; i >= 0; i-- {
+		if !commits[i].Signature.Valid() {
+			d.Logger.Log("err", "invalid GPG signature for commit", "revision", commits[i].Revision, "key", commits[i].Signature.Key)
+			if i+1 < len(commits) {
+				return commits[i+1].Revision, nil
+			}
+			return "", nil
+		}
+	}
+
+	return newRevision, nil
 }
 
 func (d *Daemon) LogEvent(ev event.Event) error {

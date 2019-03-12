@@ -218,6 +218,15 @@ func (r *Repo) CommitsBetween(ctx context.Context, ref1, ref2 string, paths ...s
 	return onelinelog(ctx, r.dir, ref1+".."+ref2, paths)
 }
 
+func (r *Repo) VerifyTag(ctx context.Context, tag string) error {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if err := r.errorIfNotReady(); err != nil {
+		return err
+	}
+	return verifyTag(ctx, r.dir, tag)
+}
+
 // step attempts to advance the repo state machine, and returns `true`
 // if it has made progress, `false` otherwise.
 func (r *Repo) step(bg context.Context) bool {

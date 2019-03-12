@@ -37,7 +37,8 @@ func (d *Daemon) Loop(stop chan struct{}, wg *sync.WaitGroup, logger log.Logger)
 	// available.
 	imagePollTimer := time.NewTimer(d.RegistryPollInterval)
 
-	// Keep track of current HEAD, so we can know when to treat a repo
+	// Keep track of current, verified (if signature verification is
+	// enabled), HEAD, so we can know when to treat a repo
 	// mirror notification as a change. Otherwise, we'll just sync
 	// every timer tick as well as every mirror refresh.
 	syncHead := ""
@@ -72,7 +73,7 @@ func (d *Daemon) Loop(stop chan struct{}, wg *sync.WaitGroup, logger log.Logger)
 				default:
 				}
 			}
-			sync, err := d.NewSync(logger)
+			sync, err := d.NewSync(logger, syncHead)
 			if err != nil {
 				logger.Log("err", err)
 				continue
@@ -89,7 +90,7 @@ func (d *Daemon) Loop(stop chan struct{}, wg *sync.WaitGroup, logger log.Logger)
 			d.AskForSync()
 		case <-d.Repo.C:
 			ctx, cancel := context.WithTimeout(context.Background(), d.GitConfig.Timeout)
-			newSyncHead, err := d.Repo.Revision(ctx, d.GitConfig.Branch)
+			newSyncHead, err := d.LatestValidRevision(ctx, syncHead)
 			cancel()
 			if err != nil {
 				logger.Log("url", d.Repo.Origin().URL, "err", err)

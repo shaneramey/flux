@@ -2,9 +2,9 @@ package daemon
 
 import (
 	"context"
-	"github.com/weaveworks/flux/gpg/gpgtest"
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -42,18 +42,7 @@ var (
 	}
 )
 
-func setupSync(t *testing.T, gitConfig git.Config, signCommits, verifySignatures bool) (*Sync, func()) {
-	var gpgHome, gpgKey string
-	var gpgCleanup = func() {}
-	if signCommits {
-		gpgHome, gpgKey, gpgCleanup = gpgtest.GPGKey(t)
-
-		os.Setenv("GNUPGHOME", gpgHome)
-		gitConfig.SigningKey = gpgKey
-	}
-
-	gitConfig.VerifySignatures = verifySignatures
-
+func setupSync(t *testing.T, gitConfig git.Config) (*Sync, func()) {
 	checkout, repo, cleanup := gittest.CheckoutWithConfig(t, gitConfig)
 
 	k8s = &cluster.Mock{}
@@ -81,10 +70,7 @@ func setupSync(t *testing.T, gitConfig git.Config, signCommits, verifySignatures
 	}
 
 	return s, func() {
-		s.working.Clean() // we may be working with an alternative working clone
 		cleanup()
-		gpgCleanup()
-		os.Unsetenv("GNUPGHOME")
 		syncCalled = 0
 		syncDef = nil
 		k8s = nil
@@ -92,144 +78,175 @@ func setupSync(t *testing.T, gitConfig git.Config, signCommits, verifySignatures
 	}
 }
 
-func TestRun_InitialSync(t *testing.T) {
-	testCases := map[string]struct {
-		gitConfig         git.Config
-		signCommits       bool
-		verifySignatures  bool
-		seedInvalidCommit bool
+func TestRun_Initial(t *testing.T) {
+	s, cleanup := setupSync(t, defaultGitConfig)
+	defer cleanup()
 
-		expectRunError      bool
-		expectSyncCalled    bool
-		expectSyncTagChange bool
-	}{
-		"default": {defaultGitConfig, false, false, false, false, true, true},
-		"signed commits without signature verification":     {defaultGitConfig, true, false, false, false, true, true},
-		"signed commits with signature verification":        {defaultGitConfig, true, true, false, false, true, true},
-		"unsigned commits with signature verification":      {defaultGitConfig, false, true, false, true, false, false},
-		"invalid signed commit with signature verification": {defaultGitConfig, true, true, true, false, true, true},
+	syncTag := lastKnownSyncTag{logger: s.logger, syncTag: s.gitConfig.SyncTag}
+	if err := s.Run(context.Background(), &syncTag); err != nil {
+		t.Fatal(err)
 	}
-	for name, tc := range testCases {
-		s, cleanup := setupSync(t, tc.gitConfig, tc.signCommits, tc.verifySignatures)
 
-		ctx := context.Background()
-		expectedRevision, _ := s.working.HeadRevision(ctx)
+	// It applies everything
+	if syncCalled != 1 {
+		t.Errorf("Sync was not called once, was called %d times", syncCalled)
+	} else if syncDef == nil {
+		t.Errorf("Sync was called with a nil syncDef")
+	}
 
-		if tc.seedInvalidCommit {
-			if err := func() error {
-				ctx, cancel := context.WithTimeout(ctx, s.gitConfig.Timeout)
-				defer cancel()
+	// Collect expected resource IDs
+	expectedResourceIDs := flux.ResourceIDs{}
+	for id, _ := range testfiles.ResourceMap {
+		expectedResourceIDs = append(expectedResourceIDs, id)
+	}
+	expectedResourceIDs.Sort()
 
-				// Create temp checkout to make modifications
-				tmpCheckout, err := s.repo.Clone(ctx, s.gitConfig)
-				defer tmpCheckout.Clean()
-				if err != nil {
-					return err
-				}
-
-				// Make modification to file
-				dirs := tmpCheckout.ManifestDirs()
-				err = cluster.UpdateManifest(s.manifests, tmpCheckout.Dir(), dirs, flux.MustParseResourceID("default:deployment/helloworld"), func(def []byte) ([]byte, error) {
-					// Empty the file, as we later verify if all
-					// resource IDs are applied this should throw an
-					// error if something is wrong.
-					return []byte(""), nil
-				})
-				if err != nil {
-					return err
-				}
-
-				// Create temp gpg signing key
-				orgGpgHome := os.Getenv("GNUPGHOME")
-				tmpGpgHome, tmpGpgKey, tmpGpgCleanup := gpgtest.GPGKey(t)
-				defer tmpGpgCleanup()
-				os.Setenv("GNUPGHOME", tmpGpgHome)
-				defer os.Setenv("GNUPGHOME", orgGpgHome)
-
-				// Commit change
-				commitAction := git.CommitAction{Author: "", Message: "unknown signature commit", SigningKey: tmpGpgKey}
-				err = tmpCheckout.CommitAndPush(ctx, commitAction, nil)
-				return err
-			}(); err != nil {
-				cleanup()
-				t.Fatalf("%s: failed to seed commit with invalid signature: %v", name, err)
-			}
-
-			if err := s.repo.Refresh(ctx); err != nil {
-				cleanup()
-				t.Fatalf("%s: failed to refresh: %v", name, err)
-			}
-
-			var err error
-			s.working, err = s.repo.Clone(context.Background(), s.gitConfig)
-			if err != nil {
-				cleanup()
-				t.Fatalf("%s: failed to clone new working repo: %v", name, err)
-			}
+	// The emitted event has all service ids
+	es, err := events.AllEvents(time.Time{}, -1, time.Time{})
+	if err != nil {
+		t.Error(err)
+	} else if len(es) != 1 {
+		t.Errorf("Unexpected events: %#v", es)
+	} else if es[0].Type != event.EventSync {
+		t.Errorf("Unexpected event type: %#v", es[0])
+	} else {
+		gotResourceIDs := es[0].ServiceIDs
+		flux.ResourceIDs(gotResourceIDs).Sort()
+		if !reflect.DeepEqual(gotResourceIDs, []flux.ResourceID(expectedResourceIDs)) {
+			t.Errorf("Unexpected event service ids: %#v, expected: %#v", gotResourceIDs, expectedResourceIDs)
 		}
+	}
 
-		syncTag := lastKnownSyncTag{logger: s.logger, syncTag: s.gitConfig.SyncTag}
+	// It creates the tag at HEAD
+	if err := s.repo.Refresh(context.Background()); err != nil {
+		t.Errorf("Pulling sync tag: %v", err)
+	} else if revs, err := s.repo.CommitsBefore(context.Background(), gitSyncTag); err != nil {
+		t.Errorf("Finding revisions before sync tag: %v", err)
+	} else if len(revs) <= 0 {
+		t.Errorf("Found no revisions before the sync tag")
+	}
 
-		// It (does not) return(s) err on run
-		err := s.Run(context.Background(), &syncTag)
-		if tc.expectRunError && err == nil {
-			t.Errorf("%s: expected err on run but did not get one", name)
-		} else if !tc.expectRunError && err != nil {
-			t.Errorf("%s: expected no err on run but got: %v", name, err)
+	// It sets the last known tag
+	if syncTag.Revision() == "" {
+		t.Errorf("Expected last known revision to be set")
+	}
+}
+
+func TestRun_NoNewCommit(t *testing.T) {
+	s, cleanup := setupSync(t, defaultGitConfig)
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), s.gitConfig.Timeout)
+	tagAction := git.TagAction{
+		Revision: "HEAD",
+		Message:  "Sync pointer",
+	}
+	if err := s.working.MoveSyncTagAndPush(ctx, tagAction); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+
+	syncTag := lastKnownSyncTag{logger: s.logger, syncTag: s.gitConfig.SyncTag}
+	if err := s.Run(context.Background(), &syncTag); err != nil {
+		t.Fatal(err)
+	}
+
+	// It applies everything
+	if syncCalled != 1 {
+		t.Errorf("Sync was not called once, was called %d times", syncCalled)
+	} else if syncDef == nil {
+		t.Errorf("Sync was called with a nil syncDef")
+	}
+
+	// It doesn't update the last known tag revision
+	if syncTag.Revision() != "" {
+		t.Errorf("Expected last known revision to be empty")
+	}
+}
+
+func TestRun_WithNewCommit(t *testing.T) {
+	s, cleanup := setupSync(t, defaultGitConfig)
+	defer cleanup()
+
+	var err error
+	var oldRevision, newRevision string
+	ctx, cancel := context.WithTimeout(context.Background(), s.gitConfig.Timeout)
+	defer cancel()
+
+	// Create existing sync tag
+	tagAction := git.TagAction{
+		Revision: "HEAD",
+		Message:  "Sync pointer",
+	}
+	if err = s.working.MoveSyncTagAndPush(ctx, tagAction); err != nil {
+		t.Fatal(err)
+	}
+	if oldRevision, err = s.working.HeadRevision(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Push new commit
+	dirs := s.working.ManifestDirs()
+	if err = cluster.UpdateManifest(s.manifests, s.working.Dir(), dirs, flux.MustParseResourceID("default:deployment/helloworld"), func(def []byte) ([]byte, error) {
+		// A simple modification so we have changes to push
+		return []byte(strings.Replace(string(def), "replicas: 5", "replicas: 4", -1)), nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	commitAction := git.CommitAction{Author: "", Message: "test commit"}
+	err = s.working.CommitAndPush(ctx, commitAction, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Get expected revision
+	newRevision, err = s.working.HeadRevision(ctx)
+	if err = s.repo.Refresh(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	syncTag := lastKnownSyncTag{logger: s.logger, syncTag: s.gitConfig.SyncTag, revision: oldRevision}
+	if err := s.Run(context.Background(), &syncTag); err != nil {
+		t.Fatal(err)
+	}
+
+	// It applies everything
+	if syncCalled != 1 {
+		t.Errorf("Sync was not called once, was called %d times", syncCalled)
+	} else if syncDef == nil {
+		t.Errorf("Sync was called with a nil syncDef")
+	}
+
+	// The emitted event has no service ids
+	es, err := events.AllEvents(time.Time{}, -1, time.Time{})
+	if err != nil {
+		t.Error(err)
+	} else if len(es) != 1 {
+		t.Errorf("Unexpected events: %#v", es)
+	} else if es[0].Type != event.EventSync {
+		t.Errorf("Unexpected event type: %#v", es[0])
+	} else {
+		gotResourceIDs := es[0].ServiceIDs
+		flux.ResourceIDs(gotResourceIDs).Sort()
+		// Event should only have changed service ids
+		if !reflect.DeepEqual(gotResourceIDs, []flux.ResourceID{flux.MustParseResourceID("default:deployment/helloworld")}) {
+			t.Errorf("Unexpected event service ids: %#v, expected: %#v", gotResourceIDs, []flux.ResourceID{flux.MustParseResourceID("default:deployment/helloworld")})
 		}
+	}
 
-		// It (does not) sync(s) to the cluster
-		expectedSyncCalls := 0
-		if tc.expectSyncCalled {
-			expectedSyncCalls = 1
-		}
-		if syncCalled != expectedSyncCalls {
-			t.Errorf("%s: sync was not called once, was called %d times", name, syncCalled)
+	// It moves sync tag
+	if err := s.repo.Refresh(ctx); err != nil {
+		t.Errorf("Pulling sync tag: %v", err)
+	} else if revs, err := s.repo.CommitsBetween(ctx, oldRevision, s.gitConfig.SyncTag); err != nil {
+		t.Errorf("Finding revisions before sync tag: %v", err)
+	} else if len(revs) <= 0 {
+		t.Errorf("Should have moved sync tag forward")
+	} else if revs[len(revs)-1].Revision != newRevision {
+		t.Errorf("Should have moved sync tag to HEAD (%s), but was moved to: %s", newRevision, revs[len(revs)-1].Revision)
+	}
 
-			if syncDef == nil {
-				t.Errorf("%s: sync was called with a nil syncDef", name)
-			}
-		}
-
-		// Collect expected resource IDs
-		expectedResourceIDs := flux.ResourceIDs{}
-		for id, _ := range testfiles.ResourceMap {
-			expectedResourceIDs = append(expectedResourceIDs, id)
-		}
-		expectedResourceIDs.Sort()
-
-		// It sends out the correct event
-		es, err := events.AllEvents(time.Time{}, -1, time.Time{})
-		if err != nil {
-			t.Errorf("%s: %v", name, err)
-		} else if !tc.expectSyncCalled && len(es) >= 1 {
-			t.Errorf("%s: expected no events got %d events", name, len(es))
-		} else if tc.expectSyncCalled && len(es) != 1 {
-			t.Errorf("%s: unexpected events: %#v", name, es)
-		} else if tc.expectSyncCalled && es[0].Type != event.EventSync {
-			t.Errorf("%s: unexpected event type: %#v", name, es[0])
-		} else if tc.expectSyncCalled {
-			gotResourceIDs := es[0].ServiceIDs
-			flux.ResourceIDs(gotResourceIDs).Sort()
-			if !reflect.DeepEqual(gotResourceIDs, []flux.ResourceID(expectedResourceIDs)) {
-				t.Errorf("%s: unexpected event service ids: %#v, expected: %#v", name, gotResourceIDs, expectedResourceIDs)
-			}
-		}
-
-		// It creates the correct tag
-		var actualRevision string
-		if err := s.repo.Refresh(ctx); err != nil {
-			t.Errorf("%s: pulling sync tag: %v", name, err)
-		} else if actualRevision, err = s.repo.Revision(ctx, s.gitConfig.SyncTag); tc.expectSyncTagChange && err != nil {
-			t.Errorf("%s: finding revision for sync tag: %v", name, err)
-		} else if tc.expectSyncTagChange && actualRevision != expectedRevision {
-			t.Errorf("%s: expected sync tag revision to be: %s, got: %s", name, expectedRevision, actualRevision)
-		} else if tc.expectSyncTagChange && syncTag.Revision() != expectedRevision {
-			t.Errorf("%s: expected last known sync tag revision to be: %s, got: %s", name, expectedRevision, syncTag.Revision())
-		} else if !tc.expectSyncTagChange && actualRevision != "" {
-			t.Errorf("%s: expected no sync tag revision, got: %s", name, actualRevision)
-		}
-
-		cleanup()
+	// It moves last known sync tag
+	if syncTag.Revision() != newRevision {
+		t.Errorf("Unexpected last known revision: %s, expected: %s", syncTag.Revision(), newRevision)
 	}
 }

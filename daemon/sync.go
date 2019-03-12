@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
-	"fmt"
 	"github.com/go-kit/kit/log"
 	"github.com/pkg/errors"
 	"strings"
@@ -47,8 +46,8 @@ type changeset struct {
 	initialSync bool
 }
 
-// NewSync initializes a new sync.
-func (d *Daemon) NewSync(logger log.Logger) (Sync, error) {
+// NewSync initializes a new sync for the given revision.
+func (d *Daemon) NewSync(logger log.Logger, revision string) (Sync, error) {
 	s := Sync{
 		logger:      logger,
 		repo:        d.Repo,
@@ -62,7 +61,16 @@ func (d *Daemon) NewSync(logger log.Logger) (Sync, error) {
 	var err error
 	ctx, cancel := context.WithTimeout(context.Background(), s.gitConfig.Timeout)
 	s.working, err = s.repo.Clone(ctx, s.gitConfig)
+	if err != nil {
+		return s, err
+	}
 	cancel()
+
+	if headRev, err := s.working.HeadRevision(context.Background()); err != nil {
+		return s, err
+	} else if headRev != revision {
+		err = s.working.Checkout(context.Background(), revision)
+	}
 
 	return s, err
 }
@@ -75,18 +83,6 @@ func (s *Sync) Run(ctx context.Context, synctag SyncTag) error {
 	c, err := getChangeset(ctx, s.working, s.repo, s.gitConfig)
 	if err != nil {
 		return err
-	}
-
-	if s.gitConfig.VerifySignatures {
-		if err := verifySyncTagSignature(ctx, s.working, c); err != nil {
-			return err
-		}
-		if err = verifyCommitSignatures(&c); err != nil {
-			s.logger.Log("err", err)
-		}
-		if err := verifyWorkingState(ctx, s.working, &c); err != nil {
-			return err
-		}
 	}
 
 	syncSetName := makeSyncLabel(s.repo.Origin(), s.gitConfig)
@@ -123,7 +119,7 @@ func (s *Sync) Run(ctx context.Context, synctag SyncTag) error {
 	}
 
 	if c.newTagRev != c.oldTagRev {
-		if err := moveSyncTag(ctx, s, c, synctag); err != nil {
+		if err := moveSyncTag(ctx, s, c); err != nil {
 			return err
 		}
 		synctag.SetRevision(c.oldTagRev, c.newTagRev)
@@ -160,71 +156,6 @@ func getChangeset(ctx context.Context, working *git.Checkout, repo *git.Repo, gi
 	cancel()
 
 	return c, err
-}
-
-// verifySyncTagSignature verifies the signature of the current sync
-// tag, if verification fails _while we are not doing an initial sync_
-// it returns an error.
-func verifySyncTagSignature(ctx context.Context, working *git.Checkout, c changeset) error {
-	if c.initialSync {
-		return nil
-	}
-	if err := working.VerifySyncTag(ctx); err != nil {
-		return errors.Wrap(err, "failed to verify signature of sync tag")
-	}
-	return nil
-}
-
-// verifyCommitSignatures verifies the signatures of the commits we are
-// working with, it does so by looping through the commits in ascending
-// order and requesting the validity of each signature. In case of
-// failure it mutates the set of the changeset of commits we are
-// working with to the ones we have validated and returns an error.
-func verifyCommitSignatures(c *changeset) error {
-	for i := len(c.commits) - 1; i >= 0; i-- {
-		if !c.commits[i].Signature.Valid() {
-			err := fmt.Errorf(
-				"invalid GPG signature for commit %s with key %s",
-				c.commits[i].Revision,
-				c.commits[i].Signature.Key,
-			)
-			c.commits = c.commits[i+1:]
-			return err
-		}
-	}
-	return nil
-}
-
-// verifyWorkingState verifies if the state of the working git
-// repository and newTagRev is still equal to the commit changeset we
-// have. This is required when working with GPG signatures as we may
-// be working with a mutated commit changeset due to commit signature
-// verification errors.
-func verifyWorkingState(ctx context.Context, working *git.Checkout, c *changeset) error {
-	// We have no valid commits, determine what we should do next...
-	if len(c.commits) == 0 {
-		// We have no state to reapply either; abort...
-		if c.initialSync {
-			return errors.New("unable to sync as no commits with valid GPG signatures were found")
-		}
-		// Reapply the old rev as this is the latest valid state we saw
-		c.newTagRev = c.oldTagRev
-		return nil
-	}
-
-	// Check if the first commit in the slice still equals the
-	// newTagRev. If this is not the case we need to checkout
-	// the working clone to the revision of the commit from the
-	// slice as otherwise we will be (re)applying unverified
-	// state on the cluster.
-	if latestCommitRev := c.commits[len(c.commits)-1].Revision; c.newTagRev != latestCommitRev {
-		if err := working.Checkout(ctx, latestCommitRev); err != nil {
-			return err
-		}
-		c.newTagRev = latestCommitRev
-		return nil
-	}
-	return nil
 }
 
 // doSync runs the actual sync of workloads on the cluster. It returns
@@ -435,7 +366,7 @@ func logCommitEvent(s *Sync, c changeset, serviceIDs flux.ResourceIDSet,
 }
 
 // moveSyncTag moves the sync tag to the revision we just synced.
-func moveSyncTag(ctx context.Context, s *Sync, c changeset, synctag SyncTag) error {
+func moveSyncTag(ctx context.Context, s *Sync, c changeset) error {
 	tagAction := git.TagAction{
 		Revision: c.newTagRev,
 		Message:  "Sync pointer",
