@@ -2,7 +2,6 @@ package gittest
 
 import (
 	"context"
-	"fmt"
 	"io/ioutil"
 	"os/exec"
 	"path/filepath"
@@ -15,7 +14,7 @@ import (
 
 // Repo creates a new clone-able git repo, pre-populated with some kubernetes
 // files and a few commits. Also returns a cleanup func to clean up after.
-func Repo(t *testing.T, signingKey string) (*git.Repo, func()) {
+func Repo(t *testing.T) (*git.Repo, func()) {
 	newDir, cleanup := testfiles.TempDir(t)
 
 	filesDir := filepath.Join(newDir, "files")
@@ -45,11 +44,7 @@ func Repo(t *testing.T, signingKey string) (*git.Repo, func()) {
 		cleanup()
 		t.Fatal(err)
 	}
-	args := []string{"-C", filesDir, "commit", "-m", "'Initial revision'"}
-	if signingKey != "" {
-		args = append(args, fmt.Sprintf("--gpg-sign=%s", signingKey))
-	}
-	if err = execCommand("git", args...); err != nil {
+	if err = execCommand("git", "-C", filesDir, "commit", "-m", "'Initial revision'"); err != nil {
 		cleanup()
 		t.Fatal(err)
 	}
@@ -80,7 +75,7 @@ func Workloads() (res []flux.ResourceID) {
 // CheckoutWithConfig makes a standard repo, clones it, and returns
 // the clone, the original repo, and a cleanup function.
 func CheckoutWithConfig(t *testing.T, config git.Config) (*git.Checkout, *git.Repo, func()) {
-	repo, cleanup := Repo(t, config.SigningKey)
+	repo, cleanup := Repo(t)
 	if err := repo.Ready(context.Background()); err != nil {
 		cleanup()
 		t.Fatal(err)

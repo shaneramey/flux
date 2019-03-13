@@ -151,7 +151,7 @@ func TestSignedTag(t *testing.T) {
 }
 
 func TestCheckout(t *testing.T) {
-	repo, cleanup := Repo(t, "")
+	repo, cleanup := Repo(t)
 	defer cleanup()
 
 	sd, sg := make(chan struct{}), &sync.WaitGroup{}

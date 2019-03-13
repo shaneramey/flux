@@ -671,7 +671,7 @@ func mockDaemon(t *testing.T) (*Daemon, func(), func(), *cluster.Mock, *mockEven
 		},
 	}
 
-	repo, repoCleanup := gittest.Repo(t, "")
+	repo, repoCleanup := gittest.Repo(t)
 	params := git.Config{
 		Branch:    "master",
 		UserName:  "example",
